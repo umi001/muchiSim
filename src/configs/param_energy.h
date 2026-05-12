@@ -90,25 +90,39 @@ double pj_per_flop_by_type[4] = {
 double cycles_per_op_by_type[4] = {1.0, 1.0, 1.0, 1.0};
 
 // Opt-in initializer that an app calls to activate non-uniform PU
-// coefficients. Apps that want the homogeneous baseline simply don't
-// call this.
+// energy coefficients. Apps that want the homogeneous baseline simply
+// don't call this.
+//
+// Timing (cycles_per_op_by_type) stays at 1.0 by default even when
+// energy coefficients differ — simulators with wildly varying per-tile
+// clocks tend to deadlock on synchronization barriers because the
+// data-flow primitives assume tiles advance at similar rates. Apps
+// that DO want per-tile timing variation (e.g., for runtime-sensitive
+// studies) call init_heterogeneous_timing() in addition.
 inline void init_heterogeneous_pu_coefficients() {
-    // CPU: 0.6x per-op energy of GPU, but 2.0x cycles-per-op (slower pipeline)
+    // CPU: 0.6x per-op energy of GPU
     pj_per_intop_by_type[0] = 0.6 * pj_per_intop_ref;
     pj_per_flop_by_type[0]  = 0.6 * pj_per_flop_ref;
-    cycles_per_op_by_type[0] = 2.0;
     // GPU: reference (matches the homogeneous baseline)
     pj_per_intop_by_type[1] = pj_per_intop_ref;
     pj_per_flop_by_type[1]  = pj_per_flop_ref;
-    cycles_per_op_by_type[1] = 1.0;
-    // ACCEL: 0.4x per-op energy (specialized dataflow), 0.5x cycles (faster)
+    // ACCEL: 0.4x per-op energy (specialized dataflow)
     pj_per_intop_by_type[2] = 0.4 * pj_per_intop_ref;
     pj_per_flop_by_type[2]  = 0.4 * pj_per_flop_ref;
-    cycles_per_op_by_type[2] = 0.5;
     // HBM: near-zero compute (HBM controller, not a real PU)
     pj_per_intop_by_type[3] = 0.05 * pj_per_intop_ref;
     pj_per_flop_by_type[3]  = 0.05 * pj_per_flop_ref;
-    cycles_per_op_by_type[3] = 4.0;  // mostly idle
+}
+
+// Optional, separate initializer for per-tile-type timing variation
+// (cycles_per_op multiplier in update_timer). Gentle multipliers only —
+// large ratios (>1.5x) cause deadlocks because the data-flow primitives
+// in router and TSU code assume tiles advance at similar rates.
+inline void init_heterogeneous_timing() {
+    cycles_per_op_by_type[0] = 1.3;  // CPU: slightly slower
+    cycles_per_op_by_type[1] = 1.0;  // GPU: reference
+    cycles_per_op_by_type[2] = 0.85; // ACCEL: slightly faster
+    cycles_per_op_by_type[3] = 1.4;  // HBM: mostly idle controller
 }
 
 

@@ -5,12 +5,24 @@ void update_timer(u_int32_t global_cid, int delay, u_int64_t compute_cycles){
   #endif
 
   u_int32_t base = global_cid*smt_per_tile;
+
+  // Per-tile-type cycle multiplier (Phase C heterogeneity). When the
+  // simulator is in homogeneous mode (default), cycles_per_op_by_type
+  // is uniformly 1.0 and these scaled values equal the unscaled inputs
+  // (-> bit-identical behaviour). When init_heterogeneous_pu_coefficients
+  // has been called (typically alongside init_tile_types_per_chiplet),
+  // CPU/HBM tiles are slower (multiplier > 1) and ACCEL tiles faster
+  // (multiplier < 1), modelling per-tile-type pipeline differences.
+  double mul = cycles_per_op_by_type[tile_type_array[global_cid]];
+  u_int64_t delay_scaled = (u_int64_t)((double)delay * mul);
+  u_int64_t compute_cycles_scaled = (u_int64_t)((double)compute_cycles * mul);
+
   // Add delay to the pu_cycles of the current thread
-  core_timer[base]+=delay;
+  core_timer[base]+=delay_scaled;
 
   // Add compute cycles to all threads since it's a shared resource
   for (int i=1; i<smt_per_tile; i++){
-    core_timer[base+i]+=compute_cycles;
+    core_timer[base+i]+=compute_cycles_scaled;
   }
 
   //Calculate min from all thread timers
