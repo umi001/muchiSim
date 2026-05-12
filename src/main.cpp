@@ -7,6 +7,11 @@
 // System Configuration Parameters
 #include "configs/config_system.h"
 #include "configs/config_queue.h"
+// Heterogeneity infrastructure: per-tile and per-die role tags. Defines
+// globals (tile_type_array, die_role), so include exactly here in the
+// single translation unit. Defaults to homogeneous (TILE_TYPE_GPU
+// everywhere) unless an app explicitly calls init_tile_types_per_chiplet.
+#include "configs/tile_layout.h"
 // Global structures and defined parameters
 #include "common/global.h"
 #include "mem/memory_util.h"
@@ -71,6 +76,14 @@ int main(int argc, char** argv) {
   area_calculation();
   cost_calculation();
   if (dry_run) return 0;
+
+  // Heterogeneity infrastructure: default every tile to TILE_TYPE_GPU
+  // and per-type energy coefficients to the homogeneous reference values
+  // (see configs/tile_layout.h, configs/param_energy.h). Apps that want
+  // heterogeneous PUs override this with init_tile_types_per_chiplet()
+  // and init_heterogeneous_pu_coefficients() from their config_app()
+  // hook before init_perf_counters() finalizes timers.
+  init_tile_types_homogeneous();
 
   init_perf_counters(); cout << "Perf counters initialized\n"<<flush;
   connect_mesh(); cout << "Mesh connected\n"<<flush;
