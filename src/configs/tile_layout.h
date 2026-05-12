@@ -65,6 +65,32 @@ u_int8_t die_role[DIES];
 bool heterogeneous_layout_enabled = false;
 
 // ----------------------------------------------------------------------
+// Per-die / per-tile-type counter aggregates (populated each ACUM print)
+// ----------------------------------------------------------------------
+//
+// Sized using GLOBAL_COUNTERS from common/macros.h (24 entries) and
+// either DIES or NUM_TILE_TYPES. Populated in calc_stats.h's
+// print_counter_stats() while it walks the per-tile counters[i][j][c]
+// arrays, then read by calc_energy.h's print_energy() to emit per-die
+// and per-tile-type energy sections in the log.
+//
+// We use 32 as a generous upper bound for GLOBAL_COUNTERS (actually 24)
+// so we don't depend on macros.h having been included before this
+// header (it is — main.cpp includes macros.h first — but keeping the
+// dependency loose makes future ordering changes safer).
+u_int64_t per_die_counters[256][32];        // [die_index][counter_id]
+u_int64_t per_type_counters[NUM_TILE_TYPES][32];
+
+inline void reset_hetero_counters() {
+    for (u_int32_t d = 0; d < DIES; d++)
+        for (u_int32_t c = 0; c < 32; c++)
+            per_die_counters[d][c] = 0;
+    for (u_int32_t t = 0; t < NUM_TILE_TYPES; t++)
+        for (u_int32_t c = 0; c < 32; c++)
+            per_type_counters[t][c] = 0;
+}
+
+// ----------------------------------------------------------------------
 // Initializers
 // ----------------------------------------------------------------------
 

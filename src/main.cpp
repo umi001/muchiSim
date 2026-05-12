@@ -84,6 +84,38 @@ int main(int argc, char** argv) {
   // and init_heterogeneous_pu_coefficients() from their config_app()
   // hook before init_perf_counters() finalizes timers.
   init_tile_types_homogeneous();
+  // Smoke-test entry point: set MUCHI_HETERO_LAYOUT=cpu,gpu,accel,hbm
+  // (or any DIES-comma-separated list of cpu/gpu/accel/hbm) to engage
+  // heterogeneity without writing a new app. Useful for validating
+  // Phase B / C output against the homogeneous baseline; production
+  // heterogeneous apps should call init_tile_types_per_chiplet()
+  // directly from config_app() instead.
+  if (const char* layout_env = std::getenv("MUCHI_HETERO_LAYOUT")) {
+    u_int8_t roles[DIES];
+    for (u_int32_t d = 0; d < DIES; d++) roles[d] = TILE_TYPE_GPU;
+    std::string s(layout_env);
+    u_int32_t d = 0;
+    size_t pos = 0;
+    while (pos < s.size() && d < DIES) {
+      size_t next = s.find(',', pos);
+      std::string token = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+      if      (token == "cpu")   roles[d] = TILE_TYPE_CPU;
+      else if (token == "gpu")   roles[d] = TILE_TYPE_GPU;
+      else if (token == "accel") roles[d] = TILE_TYPE_ACCEL;
+      else if (token == "hbm")   roles[d] = TILE_TYPE_HBM;
+      else { std::cerr << "Unknown role in MUCHI_HETERO_LAYOUT: " << token << "\n"; return 1; }
+      d++;
+      if (next == std::string::npos) break;
+      pos = next + 1;
+    }
+    if (d != DIES) {
+      std::cerr << "MUCHI_HETERO_LAYOUT had " << d << " roles but DIES=" << DIES << "\n";
+      return 1;
+    }
+    init_tile_types_per_chiplet(roles);
+    init_heterogeneous_pu_coefficients();
+    std::cout << "Heterogeneous layout engaged via MUCHI_HETERO_LAYOUT: " << layout_env << std::endl;
+  }
 
   init_perf_counters(); cout << "Perf counters initialized\n"<<flush;
   connect_mesh(); cout << "Mesh connected\n"<<flush;

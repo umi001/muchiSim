@@ -204,4 +204,107 @@ void print_energy(u_int64_t total_noc_messages, u_int64_t total_inter_board_traf
   fout << std::setprecision(2) << std::fixed;
   fout << "Avg. Power (mW): "<< avg_power_mW << endl;
   fout << "Power Density (mW/mm2): "<< avg_power_mW/vars["TOT_SYSTEM_AREA"] << endl;
+
+  // ============================================================
+  // Heterogeneous-layout extension: per-tile-type and per-die
+  // energy breakdown. Emitted only when an app explicitly opted
+  // into heterogeneity via init_tile_types_per_chiplet() (otherwise
+  // these sections would be redundant with the totals above).
+  // ============================================================
+  if (heterogeneous_layout_enabled) {
+    fout << std::setprecision(0) << std::fixed;
+
+    // ---- Per-tile-type energy ----
+    fout << "\n---Per-Type Energy---\n";
+    for (u_int32_t t = 0; t < NUM_TILE_TYPES; t++) {
+      // Per-type ops/loads/stores derived from accumulated counters
+      u_int64_t t_t1 = per_type_counters[t][TASK1];
+      u_int64_t t_t2 = per_type_counters[t][TASK2];
+      u_int64_t t_t3 = per_type_counters[t][TASK3];
+      u_int64_t t_t4 = per_type_counters[t][TASK4];
+      u_int64_t t_waits = per_type_counters[t][MEM_WAIT];
+      u_int64_t t_flops = per_type_counters[t][FLOPS];
+      u_int64_t t_ops_all = t_t1 + t_t2 + t_t3 + t_t4;
+      // Avoid going below zero if waits exceed task cycles in
+      // pathological cases.
+      u_int64_t t_ops = (t_ops_all > t_waits) ? (t_ops_all - t_waits) : 0;
+      u_int64_t t_intops = (t_ops > t_flops) ? (t_ops - t_flops) : 0;
+      u_int64_t t_loads = per_type_counters[t][LOAD];
+      u_int64_t t_stores = per_type_counters[t][STORE];
+
+      // PU dynamic energy using per-type coefficients (Phase A)
+      double pu_pj = t_intops * pj_per_intop_by_type[t]
+                   + t_flops  * pj_per_flop_by_type[t];
+      // Mem dynamic energy: per-type loads/stores * homogeneous SRAM
+      // cost (we did not introduce per-type SRAM coefficients in
+      // Phase A — see param_energy.h note).
+      double mem_pj = (double)(t_loads) * (sram_read_word_energy + sram_bank_mux_tree_energy)
+                    + (double)(t_stores) * (sram_write_word_energy + sram_bank_mux_tree_energy);
+      // Router energy is currently attributed system-wide; we report
+      // a per-type share proportional to that type's MSG_*+collision
+      // contribution as a coarse first-cut. Phase B's per-die
+      // breakdown is the more meaningful number for thermal mapping.
+      u_int64_t t_msgs = per_type_counters[t][MSG_1] + per_type_counters[t][MSG_2] + per_type_counters[t][MSG_3];
+      u_int64_t total_msgs_all_types = 0;
+      for (u_int32_t tt = 0; tt < NUM_TILE_TYPES; tt++)
+        total_msgs_all_types += per_type_counters[tt][MSG_1] + per_type_counters[tt][MSG_2] + per_type_counters[tt][MSG_3];
+      double route_pj = (total_msgs_all_types > 0)
+        ? (double)dynamic_routers_25d * (double)t_msgs / (double)total_msgs_all_types
+        : 0.0;
+
+      fout << "Type " << tile_type_names[t] << " PU Dyn E (nJ): " << (u_int64_t)(pu_pj/1000) << endl;
+      fout << "Type " << tile_type_names[t] << " Mem Dyn E (nJ): " << (u_int64_t)(mem_pj/1000) << endl;
+      fout << "Type " << tile_type_names[t] << " Route Dyn E (nJ): " << (u_int64_t)(route_pj/1000) << endl;
+    }
+
+    // ---- Per-die energy ----
+    fout << "\n---Per-Die Energy---\n";
+    for (u_int32_t d = 0; d < DIES; d++) {
+      u_int8_t role = die_role[d];
+      u_int64_t d_t1 = per_die_counters[d][TASK1];
+      u_int64_t d_t2 = per_die_counters[d][TASK2];
+      u_int64_t d_t3 = per_die_counters[d][TASK3];
+      u_int64_t d_t4 = per_die_counters[d][TASK4];
+      u_int64_t d_waits = per_die_counters[d][MEM_WAIT];
+      u_int64_t d_flops = per_die_counters[d][FLOPS];
+      u_int64_t d_ops_all = d_t1 + d_t2 + d_t3 + d_t4;
+      u_int64_t d_ops = (d_ops_all > d_waits) ? (d_ops_all - d_waits) : 0;
+      u_int64_t d_intops = (d_ops > d_flops) ? (d_ops - d_flops) : 0;
+      u_int64_t d_loads = per_die_counters[d][LOAD];
+      u_int64_t d_stores = per_die_counters[d][STORE];
+
+      // Per-die PU energy uses the die's role coefficients.
+      double pu_pj = d_intops * pj_per_intop_by_type[role]
+                   + d_flops  * pj_per_flop_by_type[role];
+      double mem_pj = (double)(d_loads) * (sram_read_word_energy + sram_bank_mux_tree_energy)
+                    + (double)(d_stores) * (sram_write_word_energy + sram_bank_mux_tree_energy);
+      // Per-die router share via per-die msg counts (proxy for
+      // bridge traffic — full per-bridge edges are a later refinement).
+      u_int64_t d_msgs = per_die_counters[d][MSG_1] + per_die_counters[d][MSG_2] + per_die_counters[d][MSG_3];
+      u_int64_t total_msgs_all_dies = 0;
+      for (u_int32_t dd = 0; dd < DIES; dd++)
+        total_msgs_all_dies += per_die_counters[dd][MSG_1] + per_die_counters[dd][MSG_2] + per_die_counters[dd][MSG_3];
+      double route_pj = (total_msgs_all_dies > 0)
+        ? (double)dynamic_routers_25d * (double)d_msgs / (double)total_msgs_all_dies
+        : 0.0;
+
+      // Leakage shared equally across dies (per-die silicon area
+      // varies only if we add per-die area accounting later).
+      double leakage_pj = (double)leakage_energy_pj / (double)DIES;
+
+      fout << "Die " << d << " Role: " << tile_type_names[role] << endl;
+      fout << "Die " << d << " PU Dyn E (nJ): " << (u_int64_t)(pu_pj/1000) << endl;
+      fout << "Die " << d << " Mem Dyn E (nJ): " << (u_int64_t)(mem_pj/1000) << endl;
+      fout << "Die " << d << " Route Dyn E (nJ): " << (u_int64_t)(route_pj/1000) << endl;
+      fout << "Die " << d << " Leakage E (nJ): " << (u_int64_t)(leakage_pj/1000) << endl;
+    }
+
+    // ---- Per-die traffic (inter-die messages OUT of die i) ----
+    fout << "\n---Per-Die Traffic---\n";
+    for (u_int32_t d = 0; d < DIES; d++) {
+      fout << "Die " << d << " Inter-die Out (msg): " << inter_die_traffic[d] << endl;
+      fout << "Die " << d << " Ruche Out (msg): " << ruche_traffic[d] << endl;
+    }
+    fout << std::setprecision(2) << std::fixed;
+  }
 }
