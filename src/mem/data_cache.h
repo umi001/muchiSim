@@ -335,6 +335,21 @@ int check_dcache(int tX,int tY, void * array, u_int64_t timer, u_int64_t & time_
           check_freq(dcache_freq, tags, set, elem_tag);
         #endif
     }
+    #if DCACHE==1
+    else {
+      // Dataset doesn't fit in DCACHE -> every access is a forced HBM
+      // read. Physically the data has to come from somewhere; treating
+      // it as "free SRAM" (the previous behaviour) under-counted memory
+      // energy. We model each call as one HBM miss to this tile's home
+      // channel; calc_energy.h then turns mc_transactions[] into HBM
+      // access energy, and the heterogeneity patch re-attributes it to
+      // the HBM-tagged die.
+      dcache_misses++;
+      u_int16_t mc_queue_id = die_id(tX,tY)*hbm_channels + (tY*DIE_W+tX)%hbm_channels;
+      mc_transactions[mc_queue_id]++;
+      pu_penalty += hbm_read_latency;
+    }
+    #endif
   #endif
   load(1);
   #if ASSERT_MODE

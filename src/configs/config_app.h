@@ -14,6 +14,8 @@
   #include "../apps/spmv_flex.h"
 #elif APP==SPMM
   #include "../apps/spmm.h"
+#elif APP==LLM_INF
+  #include "../apps/llm_inference.h"
 #else
   #include "../apps/multi.h"
 #endif

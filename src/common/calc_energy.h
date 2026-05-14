@@ -257,6 +257,26 @@ void print_energy(u_int64_t total_noc_messages, u_int64_t total_inter_board_traf
       fout << "Type " << tile_type_names[t] << " Route Dyn E (nJ): " << (u_int64_t)(route_pj/1000) << endl;
     }
 
+    // ---- HBM access energy re-attribution ----
+    // MuchiSim's hbm_access_energy_pj is accumulated system-wide via the
+    // mc_transactions[] array indexed by hbm channel. In our heterogeneous
+    // model the HBM stack physically lives on the die(s) tagged
+    // TILE_TYPE_HBM, so all HBM read energy dissipates there. Build a
+    // per-die HBM-energy attribution: full hbm_access_energy goes to the
+    // first HBM-tagged die; if multiple are tagged HBM the energy is
+    // split equally across them. The MC wire energy (request path) stays
+    // distributed by where the request originated.
+    u_int32_t n_hbm_dies = 0;
+    for (u_int32_t d = 0; d < DIES; d++)
+      if (die_role[d] == TILE_TYPE_HBM) n_hbm_dies++;
+
+    double hbm_pj_per_hbm_die = 0.0;
+    if (n_hbm_dies > 0 && total_mc_transactions > 0) {
+      u_int64_t hbm_access_energy_pj_total =
+          total_mc_transactions * hbm_channel_bit_w * hbm_read_energy_pj_bit;
+      hbm_pj_per_hbm_die = (double)hbm_access_energy_pj_total / (double)n_hbm_dies;
+    }
+
     // ---- Per-die energy ----
     fout << "\n---Per-Die Energy---\n";
     for (u_int32_t d = 0; d < DIES; d++) {
@@ -292,10 +312,15 @@ void print_energy(u_int64_t total_noc_messages, u_int64_t total_inter_board_traf
       // varies only if we add per-die area accounting later).
       double leakage_pj = (double)leakage_energy_pj / (double)DIES;
 
+      // HBM access energy is attributed only to HBM-tagged dies (see
+      // the re-attribution computed above).
+      double hbm_pj = (role == TILE_TYPE_HBM) ? hbm_pj_per_hbm_die : 0.0;
+
       fout << "Die " << d << " Role: " << tile_type_names[role] << endl;
       fout << "Die " << d << " PU Dyn E (nJ): " << (u_int64_t)(pu_pj/1000) << endl;
       fout << "Die " << d << " Mem Dyn E (nJ): " << (u_int64_t)(mem_pj/1000) << endl;
       fout << "Die " << d << " Route Dyn E (nJ): " << (u_int64_t)(route_pj/1000) << endl;
+      fout << "Die " << d << " HBM Access E (nJ): " << (u_int64_t)(hbm_pj/1000) << endl;
       fout << "Die " << d << " Leakage E (nJ): " << (u_int64_t)(leakage_pj/1000) << endl;
     }
 

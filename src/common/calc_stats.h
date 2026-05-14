@@ -310,7 +310,14 @@ void print_stats_acum(bool last_print, double sim_time){
   cout << "DRAM words: "<<dram_active_words << endl;
   cout << "  DHits: "<<dcache_hits << endl;
   cout << "  DMisses: "<<dcache_misses << endl;
-  if (dram_active_words){
+  // Sum MC transactions when the dataset lives in DRAM (the original
+  // condition) OR whenever any dcache miss has occurred. With the
+  // check_dcache else branch added in data_cache.h, misses can happen
+  // even with dram_active_words=0 (synthetic / heterogeneous workloads
+  // that issue HBM reads against on-die arrays). Without this widening,
+  // mc_transactions[] would be populated but never aggregated, leaving
+  // HBM access energy stuck at zero.
+  if (dram_active_words || dcache_misses){
     u_int64_t total_writes=0, max_trans = 0;
     double avg_latency=0;
     int max_mc = 0;
@@ -319,7 +326,8 @@ void print_stats_acum(bool last_print, double sim_time){
       total_mc_transactions += transactions;
       total_writes += mc_writebacks[i];
 
-      double avg_latency_in_mc = ((double)mc_latency[i]/transactions);
+      double avg_latency_in_mc = transactions > 0
+          ? ((double)mc_latency[i]/transactions) : 0.0;
       avg_latency += avg_latency_in_mc;
       if (transactions > max_trans){
         max_trans = transactions;
