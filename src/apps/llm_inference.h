@@ -40,6 +40,13 @@
 #endif
 #define LLM_HEAD_DIM      (LLM_HIDDEN_DIM / LLM_NUM_HEADS)
 
+// How many FP ops a single tile retires per cycle. Heuristic that converts
+// per-tile FLOP counts into a cycle penalty. Defaults to 16 (a vector-tile
+// throughput); raise for tensor-core-like tiles, lower for scalar tiles.
+#ifndef LLM_FLOPS_PER_CYCLE
+#define LLM_FLOPS_PER_CYCLE 16
+#endif
+
 // =====================================================================
 // Per-tile data slabs
 // =====================================================================
@@ -54,6 +61,21 @@ float * llm_acts = NULL;
 const u_int32_t llm_weights_words_per_tile = 1024;
 const u_int32_t llm_kv_words_per_tile      = 1024;
 const u_int32_t llm_acts_words_per_tile    = 256;
+
+// =====================================================================
+// Per-layer GEMM model (computed in config_app, consumed by task1_kernel)
+// =====================================================================
+// Decoder layer flop counts (one forward pass through one layer):
+//   QKV projections        : 3 × 2 × T × H × H        (T tokens this pass)
+//   Attention QK^T         : 2 × T × H × S            (S = effective KV length)
+//   Attention V multiply   : 2 × T × S × H
+//   Attention output proj  : 2 × T × H × H
+//   FFN gate / up / down   : 3 × 2 × T × H × F
+// Prefill: T = SEQ_LEN, S = SEQ_LEN (attention is O(S²))
+// Decode : T = 1,       S = SEQ_LEN (one new token vs full cache)
+u_int64_t llm_flops_per_layer_total = 0;       // across whole grid
+u_int64_t llm_flops_per_layer_per_tile = 0;    // per-tile slice
+int       llm_penalty_per_layer = 0;            // derived cycle count
 
 // =====================================================================
 // Required app interface
@@ -120,6 +142,34 @@ void config_app() {
     // Approximate per-tile SRAM footprint (in 32-bit words). This is small
     // for Phase 1 — Phase 4 will adjust it once HBM weight access is modeled.
     dataset_words_per_tile = llm_acts_words_per_tile;
+
+    // ----- Phase 2: per-layer GEMM cost -----
+    const u_int64_t H = LLM_HIDDEN_DIM;
+    const u_int64_t F = LLM_FFN_DIM;
+    const u_int64_t S = LLM_SEQ_LEN;
+#if LLM_PHASE == 0
+    // Prefill: T = S, attention is O(S²)
+    const u_int64_t T = S;
+    const u_int64_t attn_flops = 4ULL * T * S * H;
+#else
+    // Decode: T = 1, attention is one row against the cached S keys/values
+    const u_int64_t T = 1ULL;
+    const u_int64_t attn_flops = 4ULL * T * S * H;
+#endif
+    const u_int64_t proj_flops = 8ULL * T * H * H;       // QKV + output proj
+    const u_int64_t ffn_flops  = 6ULL * T * H * F;       // gate + up + down
+    llm_flops_per_layer_total    = proj_flops + attn_flops + ffn_flops;
+    llm_flops_per_layer_per_tile = llm_flops_per_layer_total / (u_int64_t)GRID_SIZE;
+    if (llm_flops_per_layer_per_tile == 0) llm_flops_per_layer_per_tile = 1;
+    llm_penalty_per_layer = (int)((llm_flops_per_layer_per_tile + LLM_FLOPS_PER_CYCLE - 1)
+                                  / LLM_FLOPS_PER_CYCLE);
+
+    cout << "[llm]   per-layer FLOPs total : " << llm_flops_per_layer_total << endl;
+    cout << "[llm]   per-layer FLOPs/tile  : " << llm_flops_per_layer_per_tile << endl;
+    cout << "[llm]   per-layer cycles/tile : " << llm_penalty_per_layer
+         << "  (at " << LLM_FLOPS_PER_CYCLE << " FLOPs/cycle)" << endl;
+    cout << "[llm]   est. total cycles/tile: "
+         << ((u_int64_t)llm_penalty_per_layer * LLM_NUM_LAYERS) << endl;
 }
 
 int task_init(int tX, int tY) {
@@ -136,9 +186,13 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     Msg msg = IQ(0).dequeue();
     int layer = msg.data;
 
-    // Phase 1: trivial per-layer penalty, no real computation.
-    // Later phases inject real matmul ops, HBM reads, and all-reduce here.
-    int penalty = 10;
+    // Phase 2: this tile's slice of one full decoder layer (QKV + attention
+    // + output proj + FFN). All tiles do the same work in Phase 2; Phase 4
+    // will exempt HBM-tagged tiles (they serve KV reads instead). The
+    // per-die energy already differs through the per-type energy
+    // coefficients applied in calc_energy.h.
+    flop((u_int32_t)llm_flops_per_layer_per_tile);
+    int penalty = llm_penalty_per_layer;
 
     if (layer + 1 < LLM_NUM_LAYERS) {
         IQ(0).enqueue(Msg(layer + 1, MONO, timer + penalty));
