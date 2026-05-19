@@ -129,12 +129,12 @@ void config_app() {
     task1_dest = 2;
     max_task_chunk = LOOP_CHUNK;
 
-    // Phase 1 does no cross-tile communication. Most queues stay small,
-    // but oq_sizes[dest_qid] (i.e. oq_sizes[2] when PROXY_FACTOR==1) has
-    // an assertion in config_queue() requiring at least 16 entries.
+    // Phase 3 uses channel 2 (T3) for the ring all-reduce step after each
+    // layer's matmul. Channel 1 (T2) and 3 (T3') stay unused. Sizing of
+    // oq_sizes[2] / iq_sizes[2] follows FFT's pattern (oq=16, iq=128).
     iq_sizes[1] = unused_buffer;
     oq_sizes[1] = unused_buffer;
-    iq_sizes[2] = unused_buffer;
+    iq_sizes[2] = 128;
     oq_sizes[2] = 16;
     iq_sizes[3] = unused_buffer;
     oq_sizes[3] = unused_buffer;
@@ -180,19 +180,44 @@ int task_init(int tX, int tY) {
     return 1;
 }
 
+// Helper: convert global tile id back to (x, y) for the current topology.
+// Inverse of the `global(x,y)` macro in common/macros.h.
+inline void global_to_xy(int g, int & tX, int & tY) {
+#if TORUS==1
+    tX = g & GRID_Xm1;
+    tY = g >> GRID_X_LOG2;
+#else
+    tY = g >> GRID_X_LOG2;
+    tX = g & GRID_Xm1;
+    if ((tY % 2) == 1) tX = GRID_Xm1 - tX;
+#endif
+}
+
 int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     (void)compute_cycles;
 
     Msg msg = IQ(0).dequeue();
     int layer = msg.data;
 
-    // Phase 2: this tile's slice of one full decoder layer (QKV + attention
-    // + output proj + FFN). All tiles do the same work in Phase 2; Phase 4
-    // will exempt HBM-tagged tiles (they serve KV reads instead). The
-    // per-die energy already differs through the per-type energy
-    // coefficients applied in calc_energy.h.
+    // ----- Matmul (Phase 2) -----
     flop((u_int32_t)llm_flops_per_layer_per_tile);
     int penalty = llm_penalty_per_layer;
+
+    // ----- Ring all-reduce send (Phase 3) -----
+    // After the matmul, each tile contributes one partial sum to a ring
+    // all-reduce by pushing a T3 message to the next tile in the ring
+    // (global id T -> T+1 mod GRID_SIZE). When the ring crosses a die
+    // boundary the message is charged inter-die hop latency and
+    // increments inter_die_traffic[] in the router.
+    int my_tile = global(tX, tY);
+    int next_tile = (my_tile + 1) % GRID_SIZE;
+    int next_tX, next_tY;
+    global_to_xy(next_tile, next_tX, next_tY);
+    u_int32_t head_flit = XYHeadFlit(next_tX, next_tY);
+    OQ(2).enqueue(Msg(head_flit, HEAD, timer + penalty));
+    OQ(2).enqueue(Msg(layer,     TAIL, timer + penalty));
+    store(2);
+    penalty += 4;
 
     if (layer + 1 < LLM_NUM_LAYERS) {
         IQ(0).enqueue(Msg(layer + 1, MONO, timer + penalty));
@@ -201,15 +226,21 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     return penalty;
 }
 
-// Stub kernels — populated in later phases.
 int task2_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     (void)tX; (void)tY; (void)timer; (void)compute_cycles;
     return 1;
 }
+
+// Phase 3: receive one ring all-reduce partial-sum (2-flit T3 message).
+// Phase 3 is purely structural — we count traffic, no real accumulation.
 int task3_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     (void)tX; (void)tY; (void)timer; (void)compute_cycles;
-    return 1;
+    IQ(2).dequeue();  // HEAD
+    IQ(2).dequeue();  // TAIL
+    load(1);
+    return 3;
 }
+
 int task3bis_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     (void)tX; (void)tY; (void)timer; (void)compute_cycles;
     return 1;
