@@ -92,6 +92,17 @@ int       llm_penalty_per_layer = 0;            // derived cycle count
 u_int64_t llm_hbm_reads_per_layer = 0;
 
 // =====================================================================
+// Per-layer KV-cache read model (Phase 5, decode only)
+// =====================================================================
+// In decode mode, every layer reads the entire stored KV cache to compute
+// attention against all previous tokens. K and V each have shape
+// [SEQ_LEN, HIDDEN], so total KV bytes per layer = 2 * S * H * 4B.
+// In prefill, KV is computed fresh in registers and only WRITTEN to HBM
+// (writes are not modeled as energy in MuchiSim's current accounting),
+// so llm_kv_reads_per_layer = 0 in prefill.
+u_int64_t llm_kv_reads_per_layer = 0;
+
+// =====================================================================
 // Required app interface
 // =====================================================================
 
@@ -209,6 +220,22 @@ void config_app() {
          << "  (" << n_compute_tiles << " compute tiles)" << endl;
     cout << "[llm]   HBM reads/tile/layer : " << llm_hbm_reads_per_layer
          << "  (cache line = " << cache_line_bytes << " B)" << endl;
+
+    // ----- Phase 5: KV-cache reads (decode only) -----
+#if LLM_PHASE == 1
+    // Decode: read full KV cache each layer (2 * S * H floats)
+    const u_int64_t kv_bytes_per_layer_total =
+        2ULL * (u_int64_t)LLM_SEQ_LEN * H * sizeof(float);
+    const u_int64_t kv_bytes_per_tile =
+        kv_bytes_per_layer_total / (u_int64_t)n_compute_tiles;
+    llm_kv_reads_per_layer = kv_bytes_per_tile / cache_line_bytes;
+    cout << "[llm]   KV bytes/layer       : " << kv_bytes_per_layer_total << endl;
+    cout << "[llm]   KV bytes/tile/lyr    : " << kv_bytes_per_tile << endl;
+    cout << "[llm]   KV reads/tile/layer  : " << llm_kv_reads_per_layer << endl;
+#else
+    llm_kv_reads_per_layer = 0;
+    cout << "[llm]   KV reads/tile/layer  : 0  (prefill: K/V computed in registers)" << endl;
+#endif
 }
 
 int task_init(int tX, int tY) {
@@ -248,17 +275,32 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     // increments mc_transactions[], which calc_energy.h re-attributes
     // entirely to HBM-tagged die(s).
     if (role != TILE_TYPE_HBM) {
-        const u_int64_t max_idx =
+        const u_int64_t w_max_idx =
             (u_int64_t)GRID_SIZE * (u_int64_t)llm_weights_words_per_tile;
         // Use coprime offsets (primes) per tile and per layer so reads
         // from different tiles / different layers map to different cache
         // lines. The stride = cache-line size guarantees each access
         // lands in a new tag.
-        u_int64_t base_idx =
-            ((u_int64_t)my_tile * 7919ULL + (u_int64_t)layer * 257ULL) % max_idx;
+        u_int64_t w_base =
+            ((u_int64_t)my_tile * 7919ULL + (u_int64_t)layer * 257ULL) % w_max_idx;
         for (u_int64_t k = 0; k < llm_hbm_reads_per_layer; k++) {
-            u_int64_t idx = (base_idx + k * (u_int64_t)dcache_words_in_line) % max_idx;
+            u_int64_t idx = (w_base + k * (u_int64_t)dcache_words_in_line) % w_max_idx;
             penalty += check_dcache(tX, tY, llm_weights, idx, timer + penalty);
+        }
+
+        // ----- KV-cache reads (Phase 5, decode only) -----
+        // In decode, attention reads every previously cached K and V
+        // vector against the new token. In prefill, llm_kv_reads_per_layer
+        // is 0 so the loop body never runs.
+        if (llm_kv_reads_per_layer > 0) {
+            const u_int64_t kv_max_idx =
+                (u_int64_t)GRID_SIZE * (u_int64_t)llm_kv_words_per_tile;
+            u_int64_t kv_base =
+                ((u_int64_t)my_tile * 6553ULL + (u_int64_t)layer * 313ULL) % kv_max_idx;
+            for (u_int64_t k = 0; k < llm_kv_reads_per_layer; k++) {
+                u_int64_t idx = (kv_base + k * (u_int64_t)dcache_words_in_line) % kv_max_idx;
+                penalty += check_dcache(tX, tY, llm_kv_cache, idx, timer + penalty);
+            }
         }
 
         // ----- Matmul (Phase 2) -----
