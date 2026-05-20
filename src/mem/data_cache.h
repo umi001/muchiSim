@@ -54,7 +54,23 @@ u_int64_t cache_tag(void * addr) {
   return word_index >> dcache_words_in_line_log2;
 }
 
-#if APP<ALTERNATIVE
+#if APP==LLM_INF
+// LLM_INF doesn't load a graph (graph stays NULL), so the graph-app
+// cache_tag branch below can't run. Forward-declare llm_weights here so
+// our specialized cache_tag can identify it. The definition lives in
+// apps/llm_inference.h, which is included later than this header.
+extern float * llm_weights;
+
+u_int64_t cache_tag(void * addr, u_int64_t index) {
+    // The only HBM-resident array in LLM_INF is llm_weights. Map (addr,
+    // index) directly to a cache-line tag without touching graph->.
+    if (addr == llm_weights) {
+        return index >> dcache_words_in_line_log2;
+    }
+    ASSERT_MSG(false, "cache_tag called with unknown array under APP=LLM_INF");
+    return 0;
+}
+#elif APP<ALTERNATIVE
   u_int64_t cache_tag(void * addr, u_int64_t index) {
     u_int64_t ret_len = graph->nodes;
     #if APP==SPMM

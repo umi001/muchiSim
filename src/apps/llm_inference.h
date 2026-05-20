@@ -78,6 +78,20 @@ u_int64_t llm_flops_per_layer_per_tile = 0;    // per-tile slice
 int       llm_penalty_per_layer = 0;            // derived cycle count
 
 // =====================================================================
+// Per-layer HBM weight-fetch model (Phase 4)
+// =====================================================================
+// Each compute tile reads its slice of the layer's weights from HBM via
+// check_dcache. The number of reads is derived from the actual weight
+// bytes:
+//   QKV projections:    3 × H × H × 4B
+//   Output projection:    H × H × 4B
+//   FFN gate / up / down: 3 × H × F × 4B
+// Total per layer: (4H² + 3HF) × sizeof(float) bytes,
+// split across (GRID_SIZE - HBM_tile_count) compute tiles.
+// We divide by cache-line bytes to get reads-per-tile-per-layer.
+u_int64_t llm_hbm_reads_per_layer = 0;
+
+// =====================================================================
 // Required app interface
 // =====================================================================
 
@@ -170,6 +184,31 @@ void config_app() {
          << "  (at " << LLM_FLOPS_PER_CYCLE << " FLOPs/cycle)" << endl;
     cout << "[llm]   est. total cycles/tile: "
          << ((u_int64_t)llm_penalty_per_layer * LLM_NUM_LAYERS) << endl;
+
+    // ----- Phase 4: HBM weight-fetch rate -----
+    // Count how many tiles will act as compute (everything not HBM). With
+    // the homogeneous default all tiles are GPU; with a 4-die hetero
+    // layout, three of four dies are compute (3*256 = 768 tiles).
+    u_int32_t n_compute_tiles = 0;
+    for (u_int32_t i = 0; i < GRID_SIZE; i++) {
+        if (tile_type_array[i] != TILE_TYPE_HBM) n_compute_tiles++;
+    }
+    if (n_compute_tiles == 0) n_compute_tiles = 1;  // guard
+
+    const u_int64_t weight_bytes_per_layer_total =
+        (4ULL * H * H + 3ULL * H * F) * sizeof(float);
+    const u_int64_t weight_bytes_per_tile =
+        weight_bytes_per_layer_total / (u_int64_t)n_compute_tiles;
+    const u_int64_t cache_line_bytes =
+        (u_int64_t)dcache_words_in_line * sizeof(u_int32_t);  // typically 64 B
+    llm_hbm_reads_per_layer = weight_bytes_per_tile / cache_line_bytes;
+    if (llm_hbm_reads_per_layer == 0) llm_hbm_reads_per_layer = 1;
+
+    cout << "[llm]   weight bytes/layer   : " << weight_bytes_per_layer_total << endl;
+    cout << "[llm]   weight bytes/tile/lyr: " << weight_bytes_per_tile
+         << "  (" << n_compute_tiles << " compute tiles)" << endl;
+    cout << "[llm]   HBM reads/tile/layer : " << llm_hbm_reads_per_layer
+         << "  (cache line = " << cache_line_bytes << " B)" << endl;
 }
 
 int task_init(int tX, int tY) {
@@ -198,18 +237,44 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
 
     Msg msg = IQ(0).dequeue();
     int layer = msg.data;
+    int penalty = 0;
 
-    // ----- Matmul (Phase 2) -----
-    flop((u_int32_t)llm_flops_per_layer_per_tile);
-    int penalty = llm_penalty_per_layer;
+    int my_tile = global(tX, tY);
+    u_int8_t role = tile_type_array[my_tile];
+
+    // ----- HBM weight fetch (Phase 4) -----
+    // Compute tiles (everything except HBM-tagged tiles) read their slice
+    // of the layer weights from HBM via cache-missing accesses. Each miss
+    // increments mc_transactions[], which calc_energy.h re-attributes
+    // entirely to HBM-tagged die(s).
+    if (role != TILE_TYPE_HBM) {
+        const u_int64_t max_idx =
+            (u_int64_t)GRID_SIZE * (u_int64_t)llm_weights_words_per_tile;
+        // Use coprime offsets (primes) per tile and per layer so reads
+        // from different tiles / different layers map to different cache
+        // lines. The stride = cache-line size guarantees each access
+        // lands in a new tag.
+        u_int64_t base_idx =
+            ((u_int64_t)my_tile * 7919ULL + (u_int64_t)layer * 257ULL) % max_idx;
+        for (u_int64_t k = 0; k < llm_hbm_reads_per_layer; k++) {
+            u_int64_t idx = (base_idx + k * (u_int64_t)dcache_words_in_line) % max_idx;
+            penalty += check_dcache(tX, tY, llm_weights, idx, timer + penalty);
+        }
+
+        // ----- Matmul (Phase 2) -----
+        flop((u_int32_t)llm_flops_per_layer_per_tile);
+        penalty += llm_penalty_per_layer;
+    } else {
+        // HBM tiles act as memory devices: they do no compute and no
+        // weight fetch. Their participation in the ring (below) keeps
+        // the all-reduce topology consistent. A small idle penalty
+        // approximates the controller overhead of forwarding.
+        penalty += 4;
+    }
 
     // ----- Ring all-reduce send (Phase 3) -----
-    // After the matmul, each tile contributes one partial sum to a ring
-    // all-reduce by pushing a T3 message to the next tile in the ring
-    // (global id T -> T+1 mod GRID_SIZE). When the ring crosses a die
-    // boundary the message is charged inter-die hop latency and
-    // increments inter_die_traffic[] in the router.
-    int my_tile = global(tX, tY);
+    // Every tile participates in the ring, including HBM-tagged tiles
+    // (they forward partial sums without adding to them in this model).
     int next_tile = (my_tile + 1) % GRID_SIZE;
     int next_tX, next_tY;
     global_to_xy(next_tile, next_tX, next_tY);
