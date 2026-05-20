@@ -48,6 +48,35 @@
 #endif
 
 // =====================================================================
+// Combined-run mode (Phase 7-C): one MuchiSim run that switches phase
+// mid-simulation, producing time-resolved per-die data spanning the
+// prefill->decode handoff in real LLM inference.
+//
+// When LLM_COMBINED_RUN=0 (default), LLM_PHASE selects a single mode
+// for the entire run (existing Phase 1-6 behavior, fully backwards
+// compatible).
+//
+// When LLM_COMBINED_RUN=1, the kernel switches per-layer-iteration:
+//   passes [0, LLM_PREFILL_PASSES)        run in prefill mode
+//   passes [LLM_PREFILL_PASSES, total)    run in decode mode
+// The IQ[0] message carries iter = pass_idx * LLM_NUM_LAYERS + layer.
+// =====================================================================
+#ifndef LLM_COMBINED_RUN
+#define LLM_COMBINED_RUN 0
+#endif
+#ifndef LLM_PREFILL_PASSES
+#define LLM_PREFILL_PASSES 1
+#endif
+#ifndef LLM_DECODE_PASSES
+#define LLM_DECODE_PASSES 1
+#endif
+#if LLM_COMBINED_RUN
+#define LLM_TOTAL_PASSES (LLM_PREFILL_PASSES + LLM_DECODE_PASSES)
+#else
+#define LLM_TOTAL_PASSES 1
+#endif
+
+// =====================================================================
 // Per-tile data slabs
 // =====================================================================
 // In later phases:
@@ -101,6 +130,20 @@ u_int64_t llm_hbm_reads_per_layer = 0;
 // (writes are not modeled as energy in MuchiSim's current accounting),
 // so llm_kv_reads_per_layer = 0 in prefill.
 u_int64_t llm_kv_reads_per_layer = 0;
+
+// =====================================================================
+// Per-phase derived constants for combined-run mode (Phase 7-C)
+// =====================================================================
+// In combined mode we need separate constants for each phase because the
+// kernel chooses between them per layer-iteration. In single-phase mode
+// these stay at 0 and are unused.
+#if LLM_COMBINED_RUN
+u_int64_t prefill_flops_per_layer_per_tile = 0;
+int       prefill_penalty_per_layer = 0;
+u_int64_t decode_flops_per_layer_per_tile  = 0;
+int       decode_penalty_per_layer  = 0;
+u_int64_t decode_kv_reads_per_layer = 0;  // prefill_kv_reads is always 0
+#endif
 
 // =====================================================================
 // Required app interface
@@ -236,6 +279,53 @@ void config_app() {
     llm_kv_reads_per_layer = 0;
     cout << "[llm]   KV reads/tile/layer  : 0  (prefill: K/V computed in registers)" << endl;
 #endif
+
+    // ----- Phase 7-C: per-phase constants for combined run -----
+    // Compute BOTH prefill and decode derived values so task1_kernel can
+    // switch per layer-iteration. The single-phase llm_* globals above
+    // stay unchanged so the rest of Phase 1-6 logic is untouched.
+#if LLM_COMBINED_RUN
+    {
+        // Prefill: T = SEQ_LEN (process all tokens at once)
+        const u_int64_t Tp = S;
+        const u_int64_t attn_p = 4ULL * Tp * S * H;
+        const u_int64_t proj_p = 8ULL * Tp * H * H;
+        const u_int64_t ffn_p  = 6ULL * Tp * H * F;
+        u_int64_t total_p = proj_p + attn_p + ffn_p;
+        u_int64_t per_tile_p = total_p / (u_int64_t)GRID_SIZE;
+        if (per_tile_p == 0) per_tile_p = 1;
+        prefill_flops_per_layer_per_tile = per_tile_p;
+        prefill_penalty_per_layer =
+            (int)((per_tile_p + LLM_FLOPS_PER_CYCLE - 1) / LLM_FLOPS_PER_CYCLE);
+    }
+    {
+        // Decode: T = 1 (one new token)
+        const u_int64_t Td = 1ULL;
+        const u_int64_t attn_d = 4ULL * Td * S * H;
+        const u_int64_t proj_d = 8ULL * Td * H * H;
+        const u_int64_t ffn_d  = 6ULL * Td * H * F;
+        u_int64_t total_d = proj_d + attn_d + ffn_d;
+        u_int64_t per_tile_d = total_d / (u_int64_t)GRID_SIZE;
+        if (per_tile_d == 0) per_tile_d = 1;
+        decode_flops_per_layer_per_tile = per_tile_d;
+        decode_penalty_per_layer =
+            (int)((per_tile_d + LLM_FLOPS_PER_CYCLE - 1) / LLM_FLOPS_PER_CYCLE);
+        // Decode KV reads (prefill has 0 KV reads)
+        const u_int64_t kv_bytes_total_d = 2ULL * S * H * sizeof(float);
+        const u_int64_t kv_bytes_per_tile_d =
+            kv_bytes_total_d / (u_int64_t)n_compute_tiles;
+        decode_kv_reads_per_layer = kv_bytes_per_tile_d / cache_line_bytes;
+    }
+    cout << "[llm] ===== COMBINED RUN =====\n"
+         << "[llm]   passes: " << LLM_PREFILL_PASSES << " prefill + "
+         << LLM_DECODE_PASSES << " decode = "
+         << LLM_TOTAL_PASSES << " total" << endl
+         << "[llm]   prefill: " << prefill_penalty_per_layer
+         << " cycles/tile/lyr, FLOPs " << prefill_flops_per_layer_per_tile << endl
+         << "[llm]   decode : " << decode_penalty_per_layer
+         << " cycles/tile/lyr, FLOPs " << decode_flops_per_layer_per_tile
+         << ", KV reads " << decode_kv_reads_per_layer << endl;
+#endif
 }
 
 int task_init(int tX, int tY) {
@@ -263,8 +353,27 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     (void)compute_cycles;
 
     Msg msg = IQ(0).dequeue();
-    int layer = msg.data;
+    int iter = msg.data;
     int penalty = 0;
+
+#if LLM_COMBINED_RUN
+    // Decode iter -> (pass_idx, layer)
+    int pass_idx = iter / LLM_NUM_LAYERS;
+    int layer    = iter % LLM_NUM_LAYERS;
+    bool is_prefill = (pass_idx < LLM_PREFILL_PASSES);
+    u_int32_t this_flops_per_tile = is_prefill
+        ? (u_int32_t)prefill_flops_per_layer_per_tile
+        : (u_int32_t)decode_flops_per_layer_per_tile;
+    int       this_penalty_per_lyr = is_prefill
+        ? prefill_penalty_per_layer
+        : decode_penalty_per_layer;
+    u_int64_t this_kv_reads = is_prefill ? 0ULL : decode_kv_reads_per_layer;
+#else
+    int layer = iter;
+    u_int32_t this_flops_per_tile = (u_int32_t)llm_flops_per_layer_per_tile;
+    int       this_penalty_per_lyr = llm_penalty_per_layer;
+    u_int64_t this_kv_reads = llm_kv_reads_per_layer;
+#endif
 
     int my_tile = global(tX, tY);
     u_int8_t role = tile_type_array[my_tile];
@@ -277,12 +386,12 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     if (role != TILE_TYPE_HBM) {
         const u_int64_t w_max_idx =
             (u_int64_t)GRID_SIZE * (u_int64_t)llm_weights_words_per_tile;
-        // Use coprime offsets (primes) per tile and per layer so reads
-        // from different tiles / different layers map to different cache
-        // lines. The stride = cache-line size guarantees each access
+        // Use coprime offsets (primes) per tile and per layer-iteration so
+        // reads from different tiles / different iters map to different
+        // cache lines. The stride = cache-line size guarantees each access
         // lands in a new tag.
         u_int64_t w_base =
-            ((u_int64_t)my_tile * 7919ULL + (u_int64_t)layer * 257ULL) % w_max_idx;
+            ((u_int64_t)my_tile * 7919ULL + (u_int64_t)iter * 257ULL) % w_max_idx;
         for (u_int64_t k = 0; k < llm_hbm_reads_per_layer; k++) {
             u_int64_t idx = (w_base + k * (u_int64_t)dcache_words_in_line) % w_max_idx;
             penalty += check_dcache(tX, tY, llm_weights, idx, timer + penalty);
@@ -290,22 +399,22 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
 
         // ----- KV-cache reads (Phase 5, decode only) -----
         // In decode, attention reads every previously cached K and V
-        // vector against the new token. In prefill, llm_kv_reads_per_layer
-        // is 0 so the loop body never runs.
-        if (llm_kv_reads_per_layer > 0) {
+        // vector against the new token. In prefill, this_kv_reads is 0
+        // so the loop body never runs.
+        if (this_kv_reads > 0) {
             const u_int64_t kv_max_idx =
                 (u_int64_t)GRID_SIZE * (u_int64_t)llm_kv_words_per_tile;
             u_int64_t kv_base =
-                ((u_int64_t)my_tile * 6553ULL + (u_int64_t)layer * 313ULL) % kv_max_idx;
-            for (u_int64_t k = 0; k < llm_kv_reads_per_layer; k++) {
+                ((u_int64_t)my_tile * 6553ULL + (u_int64_t)iter * 313ULL) % kv_max_idx;
+            for (u_int64_t k = 0; k < this_kv_reads; k++) {
                 u_int64_t idx = (kv_base + k * (u_int64_t)dcache_words_in_line) % kv_max_idx;
                 penalty += check_dcache(tX, tY, llm_kv_cache, idx, timer + penalty);
             }
         }
 
         // ----- Matmul (Phase 2) -----
-        flop((u_int32_t)llm_flops_per_layer_per_tile);
-        penalty += llm_penalty_per_layer;
+        flop(this_flops_per_tile);
+        penalty += this_penalty_per_lyr;
     } else {
         // HBM tiles act as memory devices: they do no compute and no
         // weight fetch. Their participation in the ring (below) keeps
@@ -322,12 +431,13 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     global_to_xy(next_tile, next_tX, next_tY);
     u_int32_t head_flit = XYHeadFlit(next_tX, next_tY);
     OQ(2).enqueue(Msg(head_flit, HEAD, timer + penalty));
-    OQ(2).enqueue(Msg(layer,     TAIL, timer + penalty));
+    OQ(2).enqueue(Msg(iter,      TAIL, timer + penalty));
     store(2);
     penalty += 4;
 
-    if (layer + 1 < LLM_NUM_LAYERS) {
-        IQ(0).enqueue(Msg(layer + 1, MONO, timer + penalty));
+    const int max_iter = LLM_TOTAL_PASSES * LLM_NUM_LAYERS;
+    if (iter + 1 < max_iter) {
+        IQ(0).enqueue(Msg(iter + 1, MONO, timer + penalty));
     }
 
     return penalty;
