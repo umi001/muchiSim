@@ -102,48 +102,36 @@ const u_int32_t llm_acts_words_per_tile    = 256;
 //   FFN gate / up / down   : 3 × 2 × T × H × F
 // Prefill: T = SEQ_LEN, S = SEQ_LEN (attention is O(S²))
 // Decode : T = 1,       S = SEQ_LEN (one new token vs full cache)
-u_int64_t llm_flops_per_layer_total = 0;       // across whole grid
-u_int64_t llm_flops_per_layer_per_tile = 0;    // per-tile slice
-int       llm_penalty_per_layer = 0;            // derived cycle count
+// =====================================================================
+// Role-based work assignment (Phase 9)
+// =====================================================================
+// Each tile role does a qualitatively different slice of the decoder
+// layer, matching how heterogeneous LLM inference systems actually
+// partition work:
+//   GPU   tiles : bulk matmul = QKV proj + output proj + FFN
+//                 (compute-heavy, weight reads from HBM)
+//   ACCEL tiles : attention   = QK^T + softmax + V multiply
+//                 (memory-heavy in decode -- reads KV cache;
+//                  compute-heavy in prefill -- O(S^2) attention)
+//   CPU   tiles : layernorm + softmax + residual + control
+//                 (very small per layer; included for completeness)
+//   HBM   tiles : memory device; no compute, no reads issued
+//
+// Within each role the work is split evenly across that role's tiles.
+// Below we precompute everything in a phase x role lookup table; the
+// kernel just does work_table[phase_idx][role].
+enum LlmPhaseId { LLM_PHASE_PREFILL = 0, LLM_PHASE_DECODE = 1, LLM_NUM_PHASE_IDS = 2 };
+const char * const llm_phase_names[LLM_NUM_PHASE_IDS] = {"prefill", "decode"};
 
-// =====================================================================
-// Per-layer HBM weight-fetch model (Phase 4)
-// =====================================================================
-// Each compute tile reads its slice of the layer's weights from HBM via
-// check_dcache. The number of reads is derived from the actual weight
-// bytes:
-//   QKV projections:    3 × H × H × 4B
-//   Output projection:    H × H × 4B
-//   FFN gate / up / down: 3 × H × F × 4B
-// Total per layer: (4H² + 3HF) × sizeof(float) bytes,
-// split across (GRID_SIZE - HBM_tile_count) compute tiles.
-// We divide by cache-line bytes to get reads-per-tile-per-layer.
-u_int64_t llm_hbm_reads_per_layer = 0;
+struct LlmRoleWork {
+    u_int64_t flops_per_layer_per_tile;
+    int       penalty_per_layer;
+    u_int64_t weight_reads_per_layer;   // HBM weight cache lines per tile per layer
+    u_int64_t kv_reads_per_layer;       // HBM KV cache lines per tile per layer
+};
 
-// =====================================================================
-// Per-layer KV-cache read model (Phase 5, decode only)
-// =====================================================================
-// In decode mode, every layer reads the entire stored KV cache to compute
-// attention against all previous tokens. K and V each have shape
-// [SEQ_LEN, HIDDEN], so total KV bytes per layer = 2 * S * H * 4B.
-// In prefill, KV is computed fresh in registers and only WRITTEN to HBM
-// (writes are not modeled as energy in MuchiSim's current accounting),
-// so llm_kv_reads_per_layer = 0 in prefill.
-u_int64_t llm_kv_reads_per_layer = 0;
-
-// =====================================================================
-// Per-phase derived constants for combined-run mode (Phase 7-C)
-// =====================================================================
-// In combined mode we need separate constants for each phase because the
-// kernel chooses between them per layer-iteration. In single-phase mode
-// these stay at 0 and are unused.
-#if LLM_COMBINED_RUN
-u_int64_t prefill_flops_per_layer_per_tile = 0;
-int       prefill_penalty_per_layer = 0;
-u_int64_t decode_flops_per_layer_per_tile  = 0;
-int       decode_penalty_per_layer  = 0;
-u_int64_t decode_kv_reads_per_layer = 0;  // prefill_kv_reads is always 0
-#endif
+LlmRoleWork work_table[LLM_NUM_PHASE_IDS][NUM_TILE_TYPES] = {};
+u_int32_t   tile_count_by_role[NUM_TILE_TYPES] = {0};
 
 // =====================================================================
 // Required app interface
@@ -211,121 +199,98 @@ void config_app() {
     // for Phase 1 — Phase 4 will adjust it once HBM weight access is modeled.
     dataset_words_per_tile = llm_acts_words_per_tile;
 
-    // ----- Phase 2: per-layer GEMM cost -----
+    // ----- Phase 9: Role-based work-table builder -----
+    // Count tiles per role. Used to split per-role total work evenly
+    // across the tiles that belong to that role.
+    for (u_int32_t r = 0; r < NUM_TILE_TYPES; r++) tile_count_by_role[r] = 0;
+    for (u_int32_t i = 0; i < GRID_SIZE; i++) {
+        tile_count_by_role[tile_type_array[i]]++;
+    }
+    u_int32_t n_gpu   = tile_count_by_role[TILE_TYPE_GPU];
+    u_int32_t n_accel = tile_count_by_role[TILE_TYPE_ACCEL];
+    u_int32_t n_cpu   = tile_count_by_role[TILE_TYPE_CPU];
+    // Guards: avoid division-by-zero when a role has no tiles (e.g. a
+    // homogeneous run with only GPU tiles). The role still gets a slot
+    // in work_table but the FLOPs/reads come out as 0 because the
+    // role doesn't actually exist in the grid.
+    if (n_gpu   == 0) n_gpu   = 1;
+    if (n_accel == 0) n_accel = 1;
+    if (n_cpu   == 0) n_cpu   = 1;
+
     const u_int64_t H = LLM_HIDDEN_DIM;
     const u_int64_t F = LLM_FFN_DIM;
     const u_int64_t S = LLM_SEQ_LEN;
-#if LLM_PHASE == 0
-    // Prefill: T = S, attention is O(S²)
-    const u_int64_t T = S;
-    const u_int64_t attn_flops = 4ULL * T * S * H;
-#else
-    // Decode: T = 1, attention is one row against the cached S keys/values
-    const u_int64_t T = 1ULL;
-    const u_int64_t attn_flops = 4ULL * T * S * H;
-#endif
-    const u_int64_t proj_flops = 8ULL * T * H * H;       // QKV + output proj
-    const u_int64_t ffn_flops  = 6ULL * T * H * F;       // gate + up + down
-    llm_flops_per_layer_total    = proj_flops + attn_flops + ffn_flops;
-    llm_flops_per_layer_per_tile = llm_flops_per_layer_total / (u_int64_t)GRID_SIZE;
-    if (llm_flops_per_layer_per_tile == 0) llm_flops_per_layer_per_tile = 1;
-    llm_penalty_per_layer = (int)((llm_flops_per_layer_per_tile + LLM_FLOPS_PER_CYCLE - 1)
-                                  / LLM_FLOPS_PER_CYCLE);
-
-    cout << "[llm]   per-layer FLOPs total : " << llm_flops_per_layer_total << endl;
-    cout << "[llm]   per-layer FLOPs/tile  : " << llm_flops_per_layer_per_tile << endl;
-    cout << "[llm]   per-layer cycles/tile : " << llm_penalty_per_layer
-         << "  (at " << LLM_FLOPS_PER_CYCLE << " FLOPs/cycle)" << endl;
-    cout << "[llm]   est. total cycles/tile: "
-         << ((u_int64_t)llm_penalty_per_layer * LLM_NUM_LAYERS) << endl;
-
-    // ----- Phase 4: HBM weight-fetch rate -----
-    // Count how many tiles will act as compute (everything not HBM). With
-    // the homogeneous default all tiles are GPU; with a 4-die hetero
-    // layout, three of four dies are compute (3*256 = 768 tiles).
-    u_int32_t n_compute_tiles = 0;
-    for (u_int32_t i = 0; i < GRID_SIZE; i++) {
-        if (tile_type_array[i] != TILE_TYPE_HBM) n_compute_tiles++;
-    }
-    if (n_compute_tiles == 0) n_compute_tiles = 1;  // guard
-
-    const u_int64_t weight_bytes_per_layer_total =
-        (4ULL * H * H + 3ULL * H * F) * sizeof(float);
-    const u_int64_t weight_bytes_per_tile =
-        weight_bytes_per_layer_total / (u_int64_t)n_compute_tiles;
     const u_int64_t cache_line_bytes =
-        (u_int64_t)dcache_words_in_line * sizeof(u_int32_t);  // typically 64 B
-    llm_hbm_reads_per_layer = weight_bytes_per_tile / cache_line_bytes;
-    if (llm_hbm_reads_per_layer == 0) llm_hbm_reads_per_layer = 1;
+        (u_int64_t)dcache_words_in_line * sizeof(u_int32_t);  // 64 B typical
 
-    cout << "[llm]   weight bytes/layer   : " << weight_bytes_per_layer_total << endl;
-    cout << "[llm]   weight bytes/tile/lyr: " << weight_bytes_per_tile
-         << "  (" << n_compute_tiles << " compute tiles)" << endl;
-    cout << "[llm]   HBM reads/tile/layer : " << llm_hbm_reads_per_layer
-         << "  (cache line = " << cache_line_bytes << " B)" << endl;
+    // Per-role TOTAL work per layer (across the whole grid).
+    // GPU does bulk matmul: QKV (3*H^2) + output proj (H^2) + FFN gate/up/down (3*H*F),
+    //   each multiplied by T (tokens this pass) and 2 (mul+add). So per layer:
+    //     bulk_flops(T) = 2 * T * (4*H^2 + 3*H*F) = 8 T H^2 + 6 T H F
+    // ACCEL does attention: QK^T (T S H) + softmax*V (T S H), each x2:
+    //     attn_flops(T) = 4 * T * S * H
+    // CPU does layernorm + softmax + residual (small, but non-zero):
+    //     cpu_flops(T) ~ 4 * T * H  (placeholder; real ops are layernorm gamma/beta
+    //                                fused multiply-add + softmax exp/normalize)
+    // GPU reads layer weights from HBM: (4*H^2 + 3*H*F) * 4 bytes
+    // ACCEL reads KV cache in decode: 2 * S * H * 4 bytes; prefill = 0 (KV is fresh)
+    // CPU reads are tiny (layernorm scale/bias); we model as 0 for now.
 
-    // ----- Phase 5: KV-cache reads (decode only) -----
-#if LLM_PHASE == 1
-    // Decode: read full KV cache each layer (2 * S * H floats)
-    const u_int64_t kv_bytes_per_layer_total =
-        2ULL * (u_int64_t)LLM_SEQ_LEN * H * sizeof(float);
-    const u_int64_t kv_bytes_per_tile =
-        kv_bytes_per_layer_total / (u_int64_t)n_compute_tiles;
-    llm_kv_reads_per_layer = kv_bytes_per_tile / cache_line_bytes;
-    cout << "[llm]   KV bytes/layer       : " << kv_bytes_per_layer_total << endl;
-    cout << "[llm]   KV bytes/tile/lyr    : " << kv_bytes_per_tile << endl;
-    cout << "[llm]   KV reads/tile/layer  : " << llm_kv_reads_per_layer << endl;
-#else
-    llm_kv_reads_per_layer = 0;
-    cout << "[llm]   KV reads/tile/layer  : 0  (prefill: K/V computed in registers)" << endl;
-#endif
+    auto fill = [&](LlmPhaseId phase, u_int64_t T, bool decode_kv) {
+        // Totals across the grid
+        u_int64_t gpu_flops_total   = 8ULL * T * H * H + 6ULL * T * H * F;
+        u_int64_t accel_flops_total = 4ULL * T * S * H;
+        u_int64_t cpu_flops_total   = 4ULL * T * H;
+        u_int64_t weight_bytes      = (4ULL * H * H + 3ULL * H * F) * sizeof(float);
+        u_int64_t kv_bytes          = decode_kv ? (2ULL * S * H * sizeof(float)) : 0ULL;
 
-    // ----- Phase 7-C: per-phase constants for combined run -----
-    // Compute BOTH prefill and decode derived values so task1_kernel can
-    // switch per layer-iteration. The single-phase llm_* globals above
-    // stay unchanged so the rest of Phase 1-6 logic is untouched.
-#if LLM_COMBINED_RUN
-    {
-        // Prefill: T = SEQ_LEN (process all tokens at once)
-        const u_int64_t Tp = S;
-        const u_int64_t attn_p = 4ULL * Tp * S * H;
-        const u_int64_t proj_p = 8ULL * Tp * H * H;
-        const u_int64_t ffn_p  = 6ULL * Tp * H * F;
-        u_int64_t total_p = proj_p + attn_p + ffn_p;
-        u_int64_t per_tile_p = total_p / (u_int64_t)GRID_SIZE;
-        if (per_tile_p == 0) per_tile_p = 1;
-        prefill_flops_per_layer_per_tile = per_tile_p;
-        prefill_penalty_per_layer =
-            (int)((per_tile_p + LLM_FLOPS_PER_CYCLE - 1) / LLM_FLOPS_PER_CYCLE);
+        auto set_role = [&](u_int8_t role, u_int64_t flops_total, u_int32_t n_tiles,
+                            u_int64_t weight_bytes_role, u_int64_t kv_bytes_role) {
+            LlmRoleWork & w = work_table[phase][role];
+            u_int64_t f_per_tile = flops_total / (u_int64_t)n_tiles;
+            if (f_per_tile == 0) f_per_tile = 1;
+            w.flops_per_layer_per_tile = f_per_tile;
+            w.penalty_per_layer = (int)((f_per_tile + LLM_FLOPS_PER_CYCLE - 1)
+                                        / LLM_FLOPS_PER_CYCLE);
+            w.weight_reads_per_layer =
+                weight_bytes_role > 0
+                    ? (weight_bytes_role / (u_int64_t)n_tiles) / cache_line_bytes
+                    : 0;
+            w.kv_reads_per_layer =
+                kv_bytes_role > 0
+                    ? (kv_bytes_role / (u_int64_t)n_tiles) / cache_line_bytes
+                    : 0;
+        };
+
+        // GPU gets weight reads but no KV reads.
+        set_role(TILE_TYPE_GPU,   gpu_flops_total,   n_gpu,   weight_bytes, 0);
+        // ACCEL gets KV reads (decode only) but no weight reads.
+        set_role(TILE_TYPE_ACCEL, accel_flops_total, n_accel, 0,            kv_bytes);
+        // CPU gets neither (its bytes are negligible at this granularity).
+        set_role(TILE_TYPE_CPU,   cpu_flops_total,   n_cpu,   0,            0);
+        // HBM tiles do nothing at all (they're memory devices, not processors).
+        // Leave HBM entry at zeros — task1_kernel branches on role and skips work.
+    };
+
+    fill(LLM_PHASE_PREFILL, /*T=*/S, /*decode_kv=*/false);
+    fill(LLM_PHASE_DECODE,  /*T=*/1, /*decode_kv=*/true);
+
+    cout << "[llm] ===== Role-based work table =====" << endl;
+    cout << "[llm]   tile counts: gpu=" << tile_count_by_role[TILE_TYPE_GPU]
+         << " cpu="   << tile_count_by_role[TILE_TYPE_CPU]
+         << " accel=" << tile_count_by_role[TILE_TYPE_ACCEL]
+         << " hbm="   << tile_count_by_role[TILE_TYPE_HBM] << endl;
+    for (u_int32_t p = 0; p < LLM_NUM_PHASE_IDS; p++) {
+        cout << "[llm]   phase=" << llm_phase_names[p] << " role-by-role:" << endl;
+        for (u_int32_t r = 0; r < NUM_TILE_TYPES; r++) {
+            const LlmRoleWork & w = work_table[p][r];
+            cout << "[llm]     " << tile_type_names[r]
+                 << ": flops/tile=" << w.flops_per_layer_per_tile
+                 << " penalty="     << w.penalty_per_layer
+                 << " W-rd="        << w.weight_reads_per_layer
+                 << " KV-rd="       << w.kv_reads_per_layer << endl;
+        }
     }
-    {
-        // Decode: T = 1 (one new token)
-        const u_int64_t Td = 1ULL;
-        const u_int64_t attn_d = 4ULL * Td * S * H;
-        const u_int64_t proj_d = 8ULL * Td * H * H;
-        const u_int64_t ffn_d  = 6ULL * Td * H * F;
-        u_int64_t total_d = proj_d + attn_d + ffn_d;
-        u_int64_t per_tile_d = total_d / (u_int64_t)GRID_SIZE;
-        if (per_tile_d == 0) per_tile_d = 1;
-        decode_flops_per_layer_per_tile = per_tile_d;
-        decode_penalty_per_layer =
-            (int)((per_tile_d + LLM_FLOPS_PER_CYCLE - 1) / LLM_FLOPS_PER_CYCLE);
-        // Decode KV reads (prefill has 0 KV reads)
-        const u_int64_t kv_bytes_total_d = 2ULL * S * H * sizeof(float);
-        const u_int64_t kv_bytes_per_tile_d =
-            kv_bytes_total_d / (u_int64_t)n_compute_tiles;
-        decode_kv_reads_per_layer = kv_bytes_per_tile_d / cache_line_bytes;
-    }
-    cout << "[llm] ===== COMBINED RUN =====\n"
-         << "[llm]   passes: " << LLM_PREFILL_PASSES << " prefill + "
-         << LLM_DECODE_PASSES << " decode = "
-         << LLM_TOTAL_PASSES << " total" << endl
-         << "[llm]   prefill: " << prefill_penalty_per_layer
-         << " cycles/tile/lyr, FLOPs " << prefill_flops_per_layer_per_tile << endl
-         << "[llm]   decode : " << decode_penalty_per_layer
-         << " cycles/tile/lyr, FLOPs " << decode_flops_per_layer_per_tile
-         << ", KV reads " << decode_kv_reads_per_layer << endl;
-#endif
 }
 
 int task_init(int tX, int tY) {
@@ -356,70 +321,64 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     int iter = msg.data;
     int penalty = 0;
 
-#if LLM_COMBINED_RUN
-    // Decode iter -> (pass_idx, layer)
-    int pass_idx = iter / LLM_NUM_LAYERS;
-    int layer    = iter % LLM_NUM_LAYERS;
-    bool is_prefill = (pass_idx < LLM_PREFILL_PASSES);
-    u_int32_t this_flops_per_tile = is_prefill
-        ? (u_int32_t)prefill_flops_per_layer_per_tile
-        : (u_int32_t)decode_flops_per_layer_per_tile;
-    int       this_penalty_per_lyr = is_prefill
-        ? prefill_penalty_per_layer
-        : decode_penalty_per_layer;
-    u_int64_t this_kv_reads = is_prefill ? 0ULL : decode_kv_reads_per_layer;
-#else
-    int layer = iter;
-    u_int32_t this_flops_per_tile = (u_int32_t)llm_flops_per_layer_per_tile;
-    int       this_penalty_per_lyr = llm_penalty_per_layer;
-    u_int64_t this_kv_reads = llm_kv_reads_per_layer;
-#endif
-
     int my_tile = global(tX, tY);
     u_int8_t role = tile_type_array[my_tile];
 
-    // ----- HBM weight fetch (Phase 4) -----
-    // Compute tiles (everything except HBM-tagged tiles) read their slice
-    // of the layer weights from HBM via cache-missing accesses. Each miss
-    // increments mc_transactions[], which calc_energy.h re-attributes
-    // entirely to HBM-tagged die(s).
-    if (role != TILE_TYPE_HBM) {
+    // ----- Phase 9: pick (phase, role) -> per-tile work -----
+    // In single-phase mode, every layer-iter uses the same phase from
+    // LLM_PHASE. In combined-run mode, iter encodes both pass_idx and
+    // layer; passes [0, LLM_PREFILL_PASSES) are prefill, rest decode.
+    int phase_idx;
+#if LLM_COMBINED_RUN
+    int pass_idx = iter / LLM_NUM_LAYERS;
+    phase_idx = (pass_idx < LLM_PREFILL_PASSES)
+              ? LLM_PHASE_PREFILL : LLM_PHASE_DECODE;
+#else
+    phase_idx = (LLM_PHASE == 0) ? LLM_PHASE_PREFILL : LLM_PHASE_DECODE;
+#endif
+    const LlmRoleWork & w = work_table[phase_idx][role];
+
+    // ----- Weight reads (Phase 4): only roles with weight_reads > 0 -----
+    // In Phase 9 only GPU dies issue weight reads (they own bulk matmul).
+    // Each miss increments mc_transactions[], which calc_energy.h
+    // re-attributes entirely to HBM-tagged die(s).
+    if (w.weight_reads_per_layer > 0) {
         const u_int64_t w_max_idx =
             (u_int64_t)GRID_SIZE * (u_int64_t)llm_weights_words_per_tile;
-        // Use coprime offsets (primes) per tile and per layer-iteration so
-        // reads from different tiles / different iters map to different
-        // cache lines. The stride = cache-line size guarantees each access
-        // lands in a new tag.
+        // Coprime stride/offsets so reads from different tiles / layers
+        // map to different cache lines.
         u_int64_t w_base =
             ((u_int64_t)my_tile * 7919ULL + (u_int64_t)iter * 257ULL) % w_max_idx;
-        for (u_int64_t k = 0; k < llm_hbm_reads_per_layer; k++) {
+        for (u_int64_t k = 0; k < w.weight_reads_per_layer; k++) {
             u_int64_t idx = (w_base + k * (u_int64_t)dcache_words_in_line) % w_max_idx;
             penalty += check_dcache(tX, tY, llm_weights, idx, timer + penalty);
         }
+    }
 
-        // ----- KV-cache reads (Phase 5, decode only) -----
-        // In decode, attention reads every previously cached K and V
-        // vector against the new token. In prefill, this_kv_reads is 0
-        // so the loop body never runs.
-        if (this_kv_reads > 0) {
-            const u_int64_t kv_max_idx =
-                (u_int64_t)GRID_SIZE * (u_int64_t)llm_kv_words_per_tile;
-            u_int64_t kv_base =
-                ((u_int64_t)my_tile * 6553ULL + (u_int64_t)iter * 313ULL) % kv_max_idx;
-            for (u_int64_t k = 0; k < this_kv_reads; k++) {
-                u_int64_t idx = (kv_base + k * (u_int64_t)dcache_words_in_line) % kv_max_idx;
-                penalty += check_dcache(tX, tY, llm_kv_cache, idx, timer + penalty);
-            }
+    // ----- KV-cache reads (Phase 5, decode-only ACCEL): -----
+    // In Phase 9 only ACCEL dies do attention, and only in decode mode
+    // does attention read the cached K and V from HBM. Prefill computes
+    // K/V fresh in registers.
+    if (w.kv_reads_per_layer > 0) {
+        const u_int64_t kv_max_idx =
+            (u_int64_t)GRID_SIZE * (u_int64_t)llm_kv_words_per_tile;
+        u_int64_t kv_base =
+            ((u_int64_t)my_tile * 6553ULL + (u_int64_t)iter * 313ULL) % kv_max_idx;
+        for (u_int64_t k = 0; k < w.kv_reads_per_layer; k++) {
+            u_int64_t idx = (kv_base + k * (u_int64_t)dcache_words_in_line) % kv_max_idx;
+            penalty += check_dcache(tX, tY, llm_kv_cache, idx, timer + penalty);
         }
+    }
 
-        // ----- Matmul (Phase 2) -----
-        flop(this_flops_per_tile);
-        penalty += this_penalty_per_lyr;
+    // ----- Matmul (Phase 2/9): role-specific FLOPs/cycles -----
+    if (role != TILE_TYPE_HBM) {
+        flop((u_int32_t)w.flops_per_layer_per_tile);
+        penalty += w.penalty_per_layer;
     } else {
-        // HBM tiles act as memory devices: they do no compute and no
-        // weight fetch. Their participation in the ring (below) keeps
-        // the all-reduce topology consistent. A small idle penalty
-        // approximates the controller overhead of forwarding.
+        // HBM tiles are memory devices: no compute, no reads issued.
+        // They still participate in the ring all-reduce below (currently
+        // pass-through — flagged for refactor: ring should be restricted
+        // to compute dies in a future phase).
         penalty += 4;
     }
 
