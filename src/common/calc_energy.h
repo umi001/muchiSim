@@ -277,6 +277,53 @@ void print_energy(u_int64_t total_noc_messages, u_int64_t total_inter_board_traf
       hbm_pj_per_hbm_die = (double)hbm_access_energy_pj_total / (double)n_hbm_dies;
     }
 
+    // ---- Per-die activity (Phase 8 Option A) ----
+    // Raw counter values per die emitted BEFORE the derived per-die
+    // energy. The utilization-based adapter in PackageSim consumes this
+    // section directly, applying its own technology coefficients to
+    // compute power — decoupling MuchiSim's activity model from any
+    // particular technology / Vdd / efficiency assumption.
+    //
+    // Counters are CUMULATIVE since the start of simulation. PackageSim's
+    // adapter computes per-ACUM deltas across consecutive emissions
+    // (same mechanism it already uses for Per-Die Energy fields).
+    //
+    // Emitted fields per die:
+    //   Total task cycles : TASK1+TASK2+TASK3+TASK4 (gross active cycles)
+    //   Mem-wait cycles   : MEM_WAIT (subtract from task cycles -> real ops)
+    //   FLOPs             : FLOPS (FP-op count, distinguished from intops)
+    //   SRAM loads/stores : LOAD / STORE
+    //   NoC msgs          : MSG_1+MSG_2+MSG_3 (router flit movements)
+    //   HBM transactions  : sum of mc_transactions[] over this die's channels
+    fout << "\n---Per-Die Activity---\n";
+    for (u_int32_t d = 0; d < DIES; d++) {
+      u_int8_t role_a = die_role[d];
+      u_int64_t a_t1 = per_die_counters[d][TASK1];
+      u_int64_t a_t2 = per_die_counters[d][TASK2];
+      u_int64_t a_t3 = per_die_counters[d][TASK3];
+      u_int64_t a_t4 = per_die_counters[d][TASK4];
+      u_int64_t a_task_cycles = a_t1 + a_t2 + a_t3 + a_t4;
+      u_int64_t a_waits  = per_die_counters[d][MEM_WAIT];
+      u_int64_t a_flops  = per_die_counters[d][FLOPS];
+      u_int64_t a_loads  = per_die_counters[d][LOAD];
+      u_int64_t a_stores = per_die_counters[d][STORE];
+      u_int64_t a_msgs   = per_die_counters[d][MSG_1]
+                         + per_die_counters[d][MSG_2]
+                         + per_die_counters[d][MSG_3];
+      u_int64_t a_mc_txns = 0;
+      for (u_int32_t ch = 0; ch < hbm_channels; ch++) {
+        a_mc_txns += mc_transactions[d * hbm_channels + ch];
+      }
+      fout << "Die " << d << " Role: " << tile_type_names[role_a] << endl;
+      fout << "Die " << d << " Task cycles: "    << a_task_cycles << endl;
+      fout << "Die " << d << " Mem-wait cycles: " << a_waits      << endl;
+      fout << "Die " << d << " FLOPs: "          << a_flops       << endl;
+      fout << "Die " << d << " SRAM loads: "     << a_loads       << endl;
+      fout << "Die " << d << " SRAM stores: "    << a_stores      << endl;
+      fout << "Die " << d << " NoC msgs: "       << a_msgs        << endl;
+      fout << "Die " << d << " HBM transactions: " << a_mc_txns   << endl;
+    }
+
     // ---- Per-die energy ----
     fout << "\n---Per-Die Energy---\n";
     for (u_int32_t d = 0; d < DIES; d++) {
