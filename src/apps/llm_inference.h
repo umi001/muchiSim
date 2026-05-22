@@ -134,6 +134,18 @@ LlmRoleWork work_table[LLM_NUM_PHASE_IDS][NUM_TILE_TYPES] = {};
 u_int32_t   tile_count_by_role[NUM_TILE_TYPES] = {0};
 
 // =====================================================================
+// Compute-only ring topology (Phase 9.1)
+// =====================================================================
+// Real tensor-parallel all-reduce runs only across compute peers; HBM
+// dies are memory devices and never act as ring participants. This
+// table is the next-compute-tile-in-global-id-order for each tile, so
+// task1_kernel's ring-send hop is O(1) instead of scanning at runtime.
+// Built once in config_app() after tile_type_array is final.
+// Value UINT32_MAX means "no non-HBM successor" (degenerate; not
+// expected at runtime).
+u_int32_t llm_next_compute_tile[GRID_SIZE];
+
+// =====================================================================
 // Required app interface
 // =====================================================================
 
@@ -205,6 +217,30 @@ void config_app() {
     for (u_int32_t r = 0; r < NUM_TILE_TYPES; r++) tile_count_by_role[r] = 0;
     for (u_int32_t i = 0; i < GRID_SIZE; i++) {
         tile_count_by_role[tile_type_array[i]]++;
+    }
+
+    // ----- Phase 9.1: build compute-only ring topology -----
+    // For each tile t, find the next non-HBM tile in global-id order
+    // (mod GRID_SIZE). HBM tiles are memory devices and skipped.
+    for (u_int32_t t = 0; t < GRID_SIZE; t++) {
+        u_int32_t next = (t + 1) % GRID_SIZE;
+        // Walk forward at most GRID_SIZE-1 steps. If we wrap all the way
+        // back to t without finding a non-HBM tile, mark as no successor.
+        u_int32_t steps = 0;
+        while (steps < GRID_SIZE && tile_type_array[next] == TILE_TYPE_HBM) {
+            next = (next + 1) % GRID_SIZE;
+            steps++;
+        }
+        llm_next_compute_tile[t] =
+            (steps == GRID_SIZE) ? UINT32_MAX : next;
+    }
+    {
+        u_int32_t n_with_succ = 0;
+        for (u_int32_t t = 0; t < GRID_SIZE; t++)
+            if (llm_next_compute_tile[t] != UINT32_MAX) n_with_succ++;
+        cout << "[llm] ring topology: "
+             << n_with_succ << " tiles have a compute successor, "
+             << (GRID_SIZE - n_with_succ) << " do not" << endl;
     }
     u_int32_t n_gpu   = tile_count_by_role[TILE_TYPE_GPU];
     u_int32_t n_accel = tile_count_by_role[TILE_TYPE_ACCEL];
@@ -371,28 +407,31 @@ int task1_kernel(int tX, int tY, u_int64_t timer, u_int64_t & compute_cycles) {
     }
 
     // ----- Matmul (Phase 2/9): role-specific FLOPs/cycles -----
-    if (role != TILE_TYPE_HBM) {
-        flop((u_int32_t)w.flops_per_layer_per_tile);
-        penalty += w.penalty_per_layer;
-    } else {
-        // HBM tiles are memory devices: no compute, no reads issued.
-        // They still participate in the ring all-reduce below (currently
-        // pass-through — flagged for refactor: ring should be restricted
-        // to compute dies in a future phase).
+    // HBM tiles are memory devices: no compute, no reads, no ring
+    // participation, no layer re-enqueue. They process their bootstrap
+    // IQ[0] message and then go idle for the rest of the simulation.
+    if (role == TILE_TYPE_HBM) {
+        return penalty + 1;  // tiny advance so core_timer is non-zero
+    }
+    flop((u_int32_t)w.flops_per_layer_per_tile);
+    penalty += w.penalty_per_layer;
+
+    // ----- Ring all-reduce send (Phase 9.1: compute-only) -----
+    // Only compute (non-HBM) tiles participate in the tensor-parallel
+    // ring. The next ring-neighbor is the next non-HBM tile in global-id
+    // order, precomputed in llm_next_compute_tile[] during config_app.
+    // Inter-die hops happen wherever this lookup crosses a die boundary,
+    // including the case where the path goes around the HBM die.
+    u_int32_t next_tile_u = llm_next_compute_tile[my_tile];
+    if (next_tile_u != UINT32_MAX) {
+        int next_tX, next_tY;
+        global_to_xy((int)next_tile_u, next_tX, next_tY);
+        u_int32_t head_flit = XYHeadFlit(next_tX, next_tY);
+        OQ(2).enqueue(Msg(head_flit, HEAD, timer + penalty));
+        OQ(2).enqueue(Msg(iter,      TAIL, timer + penalty));
+        store(2);
         penalty += 4;
     }
-
-    // ----- Ring all-reduce send (Phase 3) -----
-    // Every tile participates in the ring, including HBM-tagged tiles
-    // (they forward partial sums without adding to them in this model).
-    int next_tile = (my_tile + 1) % GRID_SIZE;
-    int next_tX, next_tY;
-    global_to_xy(next_tile, next_tX, next_tY);
-    u_int32_t head_flit = XYHeadFlit(next_tX, next_tY);
-    OQ(2).enqueue(Msg(head_flit, HEAD, timer + penalty));
-    OQ(2).enqueue(Msg(iter,      TAIL, timer + penalty));
-    store(2);
-    penalty += 4;
 
     const int max_iter = LLM_TOTAL_PASSES * LLM_NUM_LAYERS;
     if (iter + 1 < max_iter) {
