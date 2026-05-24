@@ -123,6 +123,11 @@ void print_counter_stats(bool last_print, u_int64_t * cumm_counters, u_int64_t *
 
   double counters_f[GLOBAL_COUNTERS];
   for (int c = 0; c <GLOBAL_COUNTERS; c++) cumm_counters[c] = 0;
+  // Heterogeneity bookkeeping: reset per-die/per-type accumulators only
+  // when we're aggregating ACUM stats (not per-frame stats which only
+  // cover a sample window). The per-die/per-type arrays mirror the
+  // accum_counters: each ACUM print rebuilds them from total_counters.
+  if (!frame) reset_hetero_counters();
 
   for (u_int32_t i=0; i<len_x; i++){
     for (u_int32_t j=0; j<len_y; j++){
@@ -134,10 +139,14 @@ void print_counter_stats(bool last_print, u_int64_t * cumm_counters, u_int64_t *
         pu_cycles = get_final_time();
       }
       else pu_cycles = prev_timer[global(i,j)];
-      
+
 
       double pu_cycles_div100 = pu_cycles/100.0;
       double noc_cycles_div100 = pu_to_noc_cy(pu_cycles_div100);
+      // Per-tile heterogeneity tags (used only for the per-die / per-type
+      // accumulators; not used in counters_f or the matrix output).
+      u_int32_t this_die_id = die_id(i, j);
+      u_int8_t  this_tile_type = tile_type_array[global(i, j)];
       for (int c = 0; c <GLOBAL_COUNTERS; c++){
         u_int64_t counter;
         // Calculate active core cycles as total cycles minus idle cycles
@@ -146,6 +155,10 @@ void print_counter_stats(bool last_print, u_int64_t * cumm_counters, u_int64_t *
         if (c==ROUTER_ACTIVE || c==MSG_IN_COLLISION || c==MSG_END_COLLISION || c==MSG_OUT_COLLISION) counters_f[c] = (double)counter/noc_cycles_div100;
         else counters_f[c] = (double)counter/pu_cycles_div100;
         cumm_counters[c] += counter;
+        if (!frame) {
+          per_die_counters[this_die_id][c] += counter;
+          per_type_counters[this_tile_type][c] += counter;
+        }
       }
       
       if ((i < PRINT_X) && (j < PRINT_Y)){
@@ -297,7 +310,14 @@ void print_stats_acum(bool last_print, double sim_time){
   cout << "DRAM words: "<<dram_active_words << endl;
   cout << "  DHits: "<<dcache_hits << endl;
   cout << "  DMisses: "<<dcache_misses << endl;
-  if (dram_active_words){
+  // Sum MC transactions when the dataset lives in DRAM (the original
+  // condition) OR whenever any dcache miss has occurred. With the
+  // check_dcache else branch added in data_cache.h, misses can happen
+  // even with dram_active_words=0 (synthetic / heterogeneous workloads
+  // that issue HBM reads against on-die arrays). Without this widening,
+  // mc_transactions[] would be populated but never aggregated, leaving
+  // HBM access energy stuck at zero.
+  if (dram_active_words || dcache_misses){
     u_int64_t total_writes=0, max_trans = 0;
     double avg_latency=0;
     int max_mc = 0;
@@ -306,7 +326,8 @@ void print_stats_acum(bool last_print, double sim_time){
       total_mc_transactions += transactions;
       total_writes += mc_writebacks[i];
 
-      double avg_latency_in_mc = ((double)mc_latency[i]/transactions);
+      double avg_latency_in_mc = transactions > 0
+          ? ((double)mc_latency[i]/transactions) : 0.0;
       avg_latency += avg_latency_in_mc;
       if (transactions > max_trans){
         max_trans = transactions;

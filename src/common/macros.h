@@ -48,6 +48,7 @@ union float_int{
 #define FFT 6
 #define SPMV_FLEX 7
 #define SPMM 8
+#define LLM_INF 9
 
 #define ALTERNATIVE 10
 

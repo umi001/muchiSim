@@ -54,7 +54,29 @@ u_int64_t cache_tag(void * addr) {
   return word_index >> dcache_words_in_line_log2;
 }
 
-#if APP<ALTERNATIVE
+#if APP==LLM_INF
+// LLM_INF doesn't load a graph (graph stays NULL), so the graph-app
+// cache_tag branch below can't run. Forward-declare the HBM-resident
+// arrays here so our specialized cache_tag can identify them. The
+// definitions live in apps/llm_inference.h, which is included later
+// than this header.
+extern float * llm_weights;
+extern float * llm_kv_cache;
+
+u_int64_t cache_tag(void * addr, u_int64_t index) {
+    // The HBM-resident arrays in LLM_INF are llm_weights and llm_kv_cache.
+    // We give them disjoint tag spaces (kv_cache offset by 1<<40) so a
+    // weight read and a kv-cache read can never alias to the same line.
+    if (addr == llm_weights) {
+        return index >> dcache_words_in_line_log2;
+    }
+    if (addr == llm_kv_cache) {
+        return (index >> dcache_words_in_line_log2) | (1ULL << 40);
+    }
+    ASSERT_MSG(false, "cache_tag called with unknown array under APP=LLM_INF");
+    return 0;
+}
+#elif APP<ALTERNATIVE
   u_int64_t cache_tag(void * addr, u_int64_t index) {
     u_int64_t ret_len = graph->nodes;
     #if APP==SPMM
@@ -335,6 +357,21 @@ int check_dcache(int tX,int tY, void * array, u_int64_t timer, u_int64_t & time_
           check_freq(dcache_freq, tags, set, elem_tag);
         #endif
     }
+    #if DCACHE==1
+    else {
+      // Dataset doesn't fit in DCACHE -> every access is a forced HBM
+      // read. Physically the data has to come from somewhere; treating
+      // it as "free SRAM" (the previous behaviour) under-counted memory
+      // energy. We model each call as one HBM miss to this tile's home
+      // channel; calc_energy.h then turns mc_transactions[] into HBM
+      // access energy, and the heterogeneity patch re-attributes it to
+      // the HBM-tagged die.
+      dcache_misses++;
+      u_int16_t mc_queue_id = die_id(tX,tY)*hbm_channels + (tY*DIE_W+tX)%hbm_channels;
+      mc_transactions[mc_queue_id]++;
+      pu_penalty += hbm_read_latency;
+    }
+    #endif
   #endif
   load(1);
   #if ASSERT_MODE

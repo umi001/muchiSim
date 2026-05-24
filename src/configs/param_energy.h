@@ -53,6 +53,78 @@ const double hbm_precharge_energy_pj_bit = 0.011;
 const double pj_per_intop_ref = calc_energy_at(6,pu_vdd); //pJ per int_op
 const double pj_per_flop_ref = calc_energy_at(30,pu_vdd); //pJ per fp_op
 
+// === Per-tile-type energy coefficients (heterogeneity patch) ===
+// One entry per value in tile_layout.h::tile_type_e. Default values are
+// equal across types so that the heterogeneity infrastructure stays a
+// no-op until a heterogeneous app sets distinct values OR an experiment
+// explicitly overrides these constants. NUM_TILE_TYPES is defined in
+// tile_layout.h; we duplicate the size literal here to avoid a header
+// ordering dependency (param_energy.h is included before tile_layout.h).
+//
+// Indices: 0=CPU, 1=GPU, 2=ACCEL, 3=HBM.
+//
+// Rationale for the chosen non-default values (used when an app
+// explicitly opts in via init_heterogeneous_pu_coefficients()):
+//
+//   CPU   - simpler in-order-ish pipeline, lower per-op energy than GPU,
+//           but more memory accesses per op (cache-miss-heavy work).
+//   GPU   - reference value (same as the homogeneous baseline). SIMT
+//           scheduler + register-file accesses add overhead per op.
+//   ACCEL - specialized dataflow, fewer pipeline stages -> very low
+//           per-op energy on the ops it does do; but it does fewer ops
+//           per cycle because it relies on long-latency memory streams.
+//   HBM   - "tile" representing the HBM-stack-side controller; near-zero
+//           compute, mostly idle leakage. We set its compute coefficients
+//           low; the HBM dynamic energy is accounted for separately in
+//           the existing DRAM section of calc_energy.h.
+
+// Default (no-op): every type uses the reference value.
+double pj_per_intop_by_type[4] = {
+    pj_per_intop_ref, pj_per_intop_ref, pj_per_intop_ref, pj_per_intop_ref,
+};
+double pj_per_flop_by_type[4] = {
+    pj_per_flop_ref, pj_per_flop_ref, pj_per_flop_ref, pj_per_flop_ref,
+};
+// Per-tile-type cycles-per-op multiplier (used by Phase C). Default 1.0
+// so simulation timing is unchanged until heterogeneity is engaged.
+double cycles_per_op_by_type[4] = {1.0, 1.0, 1.0, 1.0};
+
+// Opt-in initializer that an app calls to activate non-uniform PU
+// energy coefficients. Apps that want the homogeneous baseline simply
+// don't call this.
+//
+// Timing (cycles_per_op_by_type) stays at 1.0 by default even when
+// energy coefficients differ — simulators with wildly varying per-tile
+// clocks tend to deadlock on synchronization barriers because the
+// data-flow primitives assume tiles advance at similar rates. Apps
+// that DO want per-tile timing variation (e.g., for runtime-sensitive
+// studies) call init_heterogeneous_timing() in addition.
+inline void init_heterogeneous_pu_coefficients() {
+    // CPU: 0.6x per-op energy of GPU
+    pj_per_intop_by_type[0] = 0.6 * pj_per_intop_ref;
+    pj_per_flop_by_type[0]  = 0.6 * pj_per_flop_ref;
+    // GPU: reference (matches the homogeneous baseline)
+    pj_per_intop_by_type[1] = pj_per_intop_ref;
+    pj_per_flop_by_type[1]  = pj_per_flop_ref;
+    // ACCEL: 0.4x per-op energy (specialized dataflow)
+    pj_per_intop_by_type[2] = 0.4 * pj_per_intop_ref;
+    pj_per_flop_by_type[2]  = 0.4 * pj_per_flop_ref;
+    // HBM: near-zero compute (HBM controller, not a real PU)
+    pj_per_intop_by_type[3] = 0.05 * pj_per_intop_ref;
+    pj_per_flop_by_type[3]  = 0.05 * pj_per_flop_ref;
+}
+
+// Optional, separate initializer for per-tile-type timing variation
+// (cycles_per_op multiplier in update_timer). Gentle multipliers only —
+// large ratios (>1.5x) cause deadlocks because the data-flow primitives
+// in router and TSU code assume tiles advance at similar rates.
+inline void init_heterogeneous_timing() {
+    cycles_per_op_by_type[0] = 1.3;  // CPU: slightly slower
+    cycles_per_op_by_type[1] = 1.0;  // GPU: reference
+    cycles_per_op_by_type[2] = 0.85; // ACCEL: slightly faster
+    cycles_per_op_by_type[3] = 1.4;  // HBM: mostly idle controller
+}
+
 
 // === Energy of NoC ===
 // Max length is 5mm

@@ -7,6 +7,11 @@
 // System Configuration Parameters
 #include "configs/config_system.h"
 #include "configs/config_queue.h"
+// Heterogeneity infrastructure: per-tile and per-die role tags. Defines
+// globals (tile_type_array, die_role), so include exactly here in the
+// single translation unit. Defaults to homogeneous (TILE_TYPE_GPU
+// everywhere) unless an app explicitly calls init_tile_types_per_chiplet.
+#include "configs/tile_layout.h"
 // Global structures and defined parameters
 #include "common/global.h"
 #include "mem/memory_util.h"
@@ -61,6 +66,36 @@ int main(int argc, char** argv) {
   cout << "Dry run: " << dry_run << endl;
   // ==== CONFIGURATIONS ====
   config_dataset(dataset_filename);
+  // Initialize the per-tile role layout BEFORE config_app() so the app's
+  // hook can read tile_type_array (e.g., llm_inference partitions tiles
+  // into cpu/gpu/accel/hbm role lists during config_app).
+  init_tile_types_homogeneous();
+  if (const char* layout_env = std::getenv("MUCHI_HETERO_LAYOUT")) {
+    u_int8_t roles[DIES];
+    for (u_int32_t d = 0; d < DIES; d++) roles[d] = TILE_TYPE_GPU;
+    std::string s(layout_env);
+    u_int32_t d = 0;
+    size_t pos = 0;
+    while (pos < s.size() && d < DIES) {
+      size_t next = s.find(',', pos);
+      std::string token = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+      if      (token == "cpu")   roles[d] = TILE_TYPE_CPU;
+      else if (token == "gpu")   roles[d] = TILE_TYPE_GPU;
+      else if (token == "accel") roles[d] = TILE_TYPE_ACCEL;
+      else if (token == "hbm")   roles[d] = TILE_TYPE_HBM;
+      else { std::cerr << "Unknown role in MUCHI_HETERO_LAYOUT: " << token << "\n"; return 1; }
+      d++;
+      if (next == std::string::npos) break;
+      pos = next + 1;
+    }
+    if (d != DIES) {
+      std::cerr << "MUCHI_HETERO_LAYOUT had " << d << " roles but DIES=" << DIES << "\n";
+      return 1;
+    }
+    init_tile_types_per_chiplet(roles);
+    init_heterogeneous_pu_coefficients();
+    std::cout << "Heterogeneous layout engaged via MUCHI_HETERO_LAYOUT: " << layout_env << std::endl;
+  }
   config_app();
   config_queue();
 
@@ -71,6 +106,10 @@ int main(int argc, char** argv) {
   area_calculation();
   cost_calculation();
   if (dry_run) return 0;
+
+  // (tile_type_array and per-type coefficients were initialized earlier
+  // — before config_app() — so the app could read tile_type_array during
+  // its own setup.)
 
   init_perf_counters(); cout << "Perf counters initialized\n"<<flush;
   connect_mesh(); cout << "Mesh connected\n"<<flush;
