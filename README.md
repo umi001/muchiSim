@@ -60,6 +60,135 @@ The simulator has many configuration parameters inside `src/configs`. Other para
 
 More information about muchiSim concepts are found on `src/README.md`
 
+---
+
+## Heterogeneous chiplet extension (this fork)
+
+This fork extends upstream MuchiSim — which models a **homogeneous** PE
+fabric (all tiles identical) — with a per-tile role tagging system so
+that different chiplet dies in the same simulated package can play
+qualitatively different roles (GPU compute, CPU control, AI accelerator,
+HBM memory). This was added to support workload- and package-aware
+thermal modeling in [PackageSim](../README.md), but the extension is
+self-contained and can be used standalone for any heterogeneous-system
+study.
+
+### What changed at a glance
+
+| Aspect | Upstream MuchiSim | This fork |
+|---|---|---|
+| Tile role | Single uniform PE | Per-tile tag: `gpu` / `cpu` / `accel` / `hbm` |
+| Per-die energy | Single system-wide aggregate | Per-die breakdown by role coefficient |
+| Per-die activity counters in log | Not emitted | `---Per-Die Activity---` block per ACUM print |
+| Apps differentiating roles | None | `APP=9` LLM inference assigns different operators per role |
+| Selecting heterogeneous layout | Compile-time only | Runtime via `MUCHI_HETERO_LAYOUT` env var |
+
+### Files added
+
+- `src/configs/tile_layout.h` — per-tile and per-die role enums, role arrays
+  (`tile_type_array[]`, `die_role[]`), initializers
+  (`init_tile_types_homogeneous()`, `init_tile_types_per_chiplet(roles[])`),
+  and per-die / per-type counter accumulators.
+- `src/apps/llm_inference.h` — APP=9 workload (LLaMA-7B-shaped) with
+  role-based operator partitioning (see "LLM workload" below).
+
+### Files extended
+
+- `src/configs/param_energy.h` — adds `pj_per_intop_by_type[]` and
+  `pj_per_flop_by_type[]` per-role coefficient arrays; default
+  initialization is uniform (= homogeneous) so existing apps remain
+  bit-identical to upstream until `init_heterogeneous_pu_coefficients()`
+  is called.
+- `src/common/calc_stats.h` — populates `per_die_counters[]` and
+  `per_type_counters[]` at every ACUM print.
+- `src/common/calc_energy.h` — at end of `print_energy()`, when
+  `heterogeneous_layout_enabled` is set, emits three new log blocks:
+  - `---Per-Die Activity---` (raw counters: FLOPs, SRAM loads/stores,
+    NoC msgs, HBM transactions, task cycles, mem-wait cycles, per die)
+  - `---Per-Die Energy---` (per-die PU / Mem / Route / HBM Access /
+    Leakage in nJ)
+  - `---Per-Die Traffic---` (inter-die-out, ruche-out msgs per die)
+- `src/mem/data_cache.h` — extends `cache_tag(addr, index)` with an
+  `APP==LLM_INF` branch so the LLM workload's `llm_weights` /
+  `llm_kv_cache` arrays can be passed to `check_dcache()` without
+  hitting the graph-app blessed-list assertion.
+- `src/main.cpp` — parses `MUCHI_HETERO_LAYOUT` env var
+  (`"cpu,gpu,accel,hbm"`-style) and calls `init_tile_types_per_chiplet()`
+  + `init_heterogeneous_pu_coefficients()` before `config_app()`.
+
+### Using the heterogeneity at runtime
+
+```bash
+# Build with APP=9 (LLM) on a 32x32 grid, 4 dies (DIE_W=16):
+g++ src/main.cpp -lpthread -O3 -std=c++11 \
+    -DAPP=9 -DGRID_X_LOG2=5 -DDIE_W=16 -DDIE_H=16 -DPROXY_W=32 \
+    -DTORUS=1 -DPRINT=2 -DMAX_THREADS=2 -DSRAM_SIZE=131072 \
+    -o bin/llm_hetero.run
+
+# Run with explicit per-die role assignment (one role per chiplet die,
+# in die_id order: 0, 1, 2, 3):
+MUCHI_HETERO_LAYOUT="gpu,cpu,accel,hbm" \
+    ./bin/llm_hetero.run datasets/Kron16/ 0 \
+    > sim_logs/DATA-Kron16--32-X-32--BLLM-A9.log
+
+# Without MUCHI_HETERO_LAYOUT: all dies default to "gpu" role, giving
+# the homogeneous behavior (energy values identical to upstream).
+```
+
+`PRINT=2` is required for the per-die log blocks to be emitted at every
+ACUM sample. Without `PRINT=2`, only the final end-of-run per-die
+totals appear.
+
+### LLM workload (APP=9)
+
+`src/apps/llm_inference.h` ships an LLaMA-7B-shaped LLM inference
+kernel that partitions decoder-layer operators across the four roles:
+
+| Role | Operators per layer | HBM traffic |
+|---|---|---|
+| **GPU** (`TILE_TYPE_GPU`) | Bulk matmul: QKV proj + output proj + FFN gate/up/down | Reads layer weights |
+| **ACCEL** (`TILE_TYPE_ACCEL`) | Attention: QK^T + softmax + V multiply | Reads KV cache (decode) |
+| **CPU** (`TILE_TYPE_CPU`) | Layernorm + softmax + residual + control | None |
+| **HBM** (`TILE_TYPE_HBM`) | Memory device; no compute, no reads issued, excluded from ring all-reduce | Serves all DRAM reads |
+
+Compile-time architecture overrides (LLaMA-7B defaults shown):
+
+```
+-DLLM_HIDDEN_DIM=4096    -DLLM_FFN_DIM=11008    -DLLM_NUM_HEADS=32
+-DLLM_NUM_LAYERS=32      -DLLM_SEQ_LEN=2048     -DLLM_HEAD_DIM=128
+-DLLM_PHASE=1               # 0=PREFILL, 1=DECODE
+-DLLM_FLOPS_PER_CYCLE=128   # tile throughput (FP ops/cycle)
+```
+
+Combined-run mode: simulate one prefill pass followed by N decode passes
+in a single MuchiSim invocation, capturing the realistic prefill -> decode
+transition:
+
+```
+-DLLM_COMBINED_RUN=1  -DLLM_PREFILL_PASSES=1  -DLLM_DECODE_PASSES=1
+```
+
+Inter-die communication: a ring all-reduce after each layer's matmul
+sends a 2-flit T3 message to the next compute (non-HBM) tile in
+global-id order. This is what generates the inter-die NoC traffic the
+thermal modeling consumes; HBM-tagged dies are skipped (they don't
+participate in tensor-parallel reductions).
+
+### How PackageSim consumes this
+
+The PackageSim project (parent directory) parses the `---Per-Die Activity---`
+or `---Per-Die Energy---` blocks emitted by this fork to drive a 3D
+RC-network thermal solver. See [`../README.md`](../README.md) for the
+end-to-end workflow.
+
+### Backwards compatibility
+
+This fork is bit-identical to upstream for all existing apps (SSSP, BFS,
+PageRank, WCC, SpMV, SpMV-flex, Histo, FFT, SpMM) when run without
+`MUCHI_HETERO_LAYOUT`. The per-tile role array defaults to all-GPU and
+the per-role energy coefficients default to 1.0×, so no behavioral
+change is observable unless the user explicitly engages heterogeneity.
+
 ## Research using MuchiSim
 
 MuchiSim has helped evaluating ["Tascade: Hardware Support for Atomic-free, Asynchronous and Efficient Reduction Trees
