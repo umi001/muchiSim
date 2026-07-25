@@ -16,6 +16,8 @@
   #include "../apps/spmm.h"
 #elif APP==LLM_INF
   #include "../apps/llm_inference.h"
+#elif APP==AGENTIC
+  #include "../apps/agentic.h"
 #else
   #include "../apps/multi.h"
 #endif

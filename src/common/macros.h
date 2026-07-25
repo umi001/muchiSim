@@ -49,8 +49,9 @@ union float_int{
 #define SPMV_FLEX 7
 #define SPMM 8
 #define LLM_INF 9
+#define AGENTIC 10
 
-#define ALTERNATIVE 10
+#define ALTERNATIVE 11
 
 #ifndef FUNC
   #define FUNC 1

@@ -76,6 +76,24 @@ u_int64_t cache_tag(void * addr, u_int64_t index) {
     ASSERT_MSG(false, "cache_tag called with unknown array under APP=LLM_INF");
     return 0;
 }
+#elif APP==AGENTIC
+// AGENTIC (APP=10) doesn't load a graph either; its HBM-resident arrays are
+// ag_weights and ag_kv_cache. Forward-declare them so this specialized
+// cache_tag can identify them (definitions live in apps/agentic.h, included
+// later). Same disjoint tag spaces as LLM_INF (kv_cache offset by 1<<40).
+extern float * ag_weights;
+extern float * ag_kv_cache;
+
+u_int64_t cache_tag(void * addr, u_int64_t index) {
+    if (addr == ag_weights) {
+        return index >> dcache_words_in_line_log2;
+    }
+    if (addr == ag_kv_cache) {
+        return (index >> dcache_words_in_line_log2) | (1ULL << 40);
+    }
+    ASSERT_MSG(false, "cache_tag called with unknown array under APP=AGENTIC");
+    return 0;
+}
 #elif APP<ALTERNATIVE
   u_int64_t cache_tag(void * addr, u_int64_t index) {
     u_int64_t ret_len = graph->nodes;
